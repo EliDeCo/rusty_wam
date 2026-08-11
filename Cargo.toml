@@ -4,5 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ndarray = "0.17.2"
+nalgebra = "0.35.0"
+ndarray = {version = "0.17.2", features = ["rayon"]}
 textplots = "0.8.7"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1 
