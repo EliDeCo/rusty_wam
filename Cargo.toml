@@ -1,0 +1,8 @@
+[package]
+name = "rusty_wam"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ndarray = "0.17.2"
+textplots = "0.8.7"
