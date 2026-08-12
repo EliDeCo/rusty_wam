@@ -1,3 +1,7 @@
+// This paper impliments a 1D version of the RoeM2 scheme from the following paper,
+// witht the exceptions of the f and g functions which only give benefits in higher dimensions
+// https://doi.org/10.1016/S0021-9991(02)00037-2
+
 use nalgebra::{Matrix1xX, Matrix3, Matrix3x1, Matrix3xX};
 use ndarray::linspace;
 use std::{env, ops::AddAssign};
@@ -22,6 +26,7 @@ fn decode_state(
     u: &mut Matrix1xX<f64>,
     e: &mut Matrix1xX<f64>,
     p: &mut Matrix1xX<f64>,
+    h: &mut Matrix1xX<f64>,
 ) {
     rho.copy_from(&q.row(0));
 
@@ -39,6 +44,12 @@ fn decode_state(
     p.add_assign(&*e); // p = e - 0.5*u*u   (reborrow e as &Matrix1xX)
     p.component_mul_assign(rho); // p = rho*(e - 0.5*u*u)
     *p *= GAMMA - 1.0; // p = (γ-1)*rho*(e - 0.5*u*u)
+
+    // specific total enthalpy
+    // computed in steps to avoid extra allocation
+    h.copy_from(p);
+    h.component_div_assign(rho); // h = p/rho
+    h.add_assign(&*e); // h = e + p/rho 
 }
 
 ///Calculates the Euler flux (F) for every cell given state vector q and specific heat ratio gamma.
@@ -75,12 +86,7 @@ fn roe_flux(
     df: &mut Matrix3xX<f64>,
     h: &mut Matrix1xX<f64>,
 ) {
-    decode_state(q, rho, u, e, p);
-    // specific total enthalpy
-    // computed in steps to avoid extra allocation
-    h.copy_from(p);
-    h.component_div_assign(rho); // h = p/rho
-    h.add_assign(&*e); // h = e + p/rho 
+    decode_state(q, rho, u, e, p, h);
 
     //get physical (euler) flux
     euler_flux(rho, u, e, p, f);
@@ -91,11 +97,14 @@ fn roe_flux(
         let r = (rho[i + 1] / rho[i]).sqrt();
 
         //Roe averages
-        //let roe_rho = r * rho[i]; // Roe average density, unused in flux calculation
+        let roe_rho = r * rho[i]; // Roe average density
         let roe_u = (r * u[i + 1] + u[i]) / (r + 1.0); // Roe average velocity
         let half_roe_u_squared = 0.5 * roe_u * roe_u; //intermediate quantity
         let roe_h = (r * h[i + 1] + h[i]) / (r + 1.0); // Roe average specific total enthalpy
         let roe_a = ((GAMMA - 1.0) * (roe_h - half_roe_u_squared)).sqrt(); // Roe average speed of sound
+
+        //Eigenvalues
+        let lambda: [f64; 3] = [roe_u - roe_a, roe_u, roe_u + roe_a];
 
         //difference between neighboring cell states
         let dq: Matrix3x1<f64> = Matrix3x1::new(
@@ -104,8 +113,45 @@ fn roe_flux(
             q[(2, i + 1)] - q[(2, i)], // d(rho*E)
         );
 
-        //Eigenvalues
-        let lambda: [f64; 3] = [roe_u - roe_a, roe_u, roe_u + roe_a];
+        //RoeM Changes ==================================================
+        let u_l = u[i];                               // left veloctity
+        let a_l = (GAMMA * p[i] / rho[i]).sqrt();     // left speed of sound
+        let u_r = u[i+1];                             // right velocity
+        let a_r = (GAMMA * p[i+1] / rho[i+1]).sqrt(); // right speed of sound
+
+        //intermediates
+        let b1 = lambda[2].max((u_r + a_r).max(0.0));
+        let b2 = lambda[0].min((u_l - a_l).min(0.0));
+        let b3 = b1 + b2;
+        let b4 = 2.0 * b1 * b2;
+        let b5 = 1.0 / (b1 - b2);
+
+        //other quantities
+        let m_hat = roe_u / roe_a; // Roe average Mach number
+        let p_l = p[i]; // left pressure
+        let p_r = p[i + 1]; // right pressure
+
+        // entropy-wave correction B∆Q,
+        let hlle_coeff = b1 * b2 * b5;
+        let bdq_coeff = hlle_coeff / (1.0 + m_hat.abs());    // full prefactor
+
+        let dp = p_r - p_l; // Δp
+
+        let dh = h[i + 1] - h[i]; // ΔH
+
+        let b_dq_0 = dq[0] - dp / (roe_a * roe_a); // Δρ - Δp/â²
+        let b_dq: Matrix3x1<f64> = Matrix3x1::new(
+            b_dq_0,
+            b_dq_0 * roe_u,
+            b_dq_0 * roe_h + roe_rho * dh,
+        );
+   
+        let correction: Matrix3x1<f64> = bdq_coeff * b_dq;
+
+        // accounts for swapping ΔQ -> ΔQ* = Δ(ρ,ρu,ρH) inside the HLLE base term
+        let enthalpy_shift: Matrix3x1<f64> = hlle_coeff * Matrix3x1::new(0.0, 0.0, dp);
+
+        // ==============================================================
 
         //Eigenvector matrix P
         let p_matrix: Matrix3<f64> = Matrix3::new(
@@ -138,25 +184,26 @@ fn roe_flux(
         );
 
         //skip building eignvalue matrix since its sparse, construct manually instead
-        // Project dq into characteristic (wave) space: w = P^-1 * dq
+        // 1st, project dq into characteristic (wave) space: w = P^-1 * dq
         let mut w: Matrix3x1<f64> = p_matrix_inv * dq;
 
         //technically multiplying by diagonal wave speed matrix
-        w[0] *= lambda[0].abs();
-        w[1] *= lambda[1].abs();
-        w[2] *= lambda[2].abs();
+        //Modified for RoeM
+        w[0] *= (b3 * lambda[0] - b4) * b5;
+        w[1] *= (b3 * lambda[1] - b4) * b5;
+        w[2] *= (b3 * lambda[2] - b4) * b5;
 
         // Transform back to physical space: upwind dissipation = P * |Lambda| * P^-1 * dq
         let dissipation: Matrix3x1<f64> = p_matrix * w;
 
-        // Roe flux at the interface: average of the two physical fluxes, minus half the upwind dissipation
-        col.copy_from(&(0.5 * (f.column(i) + f.column(i + 1)) - 0.5 * dissipation));
+
+        // Roe flux at the interface: average of the two physical fluxes, minus half the upwind dissipation plus RoeM correction
+        col.copy_from(&(0.5 * (f.column(i) + f.column(i + 1)) - 0.5 * dissipation + enthalpy_shift - correction));
     });
 
     // Flux divergence per interior cell: phi_{i+1/2} - phi_{i-1/2}
     phi.columns(1, N_INTERIOR).sub_to(&phi.columns(0, N_INTERIOR), df);
 }
-
 
 fn max_wave_speed(u: &Matrix1xX<f64>, a: &Matrix1xX<f64>) -> f64 {
     u.iter()
@@ -167,7 +214,7 @@ fn max_wave_speed(u: &Matrix1xX<f64>, a: &Matrix1xX<f64>) -> f64 {
 /// Left pressure = 1, right pressure = 0.1.
 /// Left density = 1, right density = 0.125.
 /// Velocity is 0 everywhere
-fn sods_problem() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
+fn _sods_problem() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
     println!("Configuration 1: Sod's problem.");
 
     let mut rho0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
@@ -186,18 +233,85 @@ fn sods_problem() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
     (rho0, u0, p0)
 }
 
+// The following are tests from section 5.1 of the reference paper
+fn _shock_tube() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
+    println!("Configuration 1: Sod's problem.");
+
+    let mut rho0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let mut u0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let mut p0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let half = N_CELLS / 2;
+
+    //left
+    rho0.columns_mut(0, half).fill(3.0);
+    u0.columns_mut(0, half).fill(0.9);
+    p0.columns_mut(0, half).fill(3.0);
+
+    //right
+    rho0.columns_mut(half, N_CELLS - half).fill(1.0);
+    u0.columns_mut(half, N_CELLS - half).fill(0.9);
+    p0.columns_mut(half, N_CELLS - half).fill(1.0);
+
+    (rho0, u0, p0)
+}
+
+fn _contact_discontinuity() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
+    println!("Configuration 1: Sod's problem.");
+
+    let mut rho0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let mut u0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let mut p0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let half = N_CELLS / 2;
+
+    //left
+    rho0.columns_mut(0, half).fill(10.0);
+    u0.columns_mut(0, half).fill(0.1125);
+    p0.columns_mut(0, half).fill(1.0);
+
+    //right
+    rho0.columns_mut(half, N_CELLS - half).fill(0.125);
+    u0.columns_mut(half, N_CELLS - half).fill(0.1125);
+    p0.columns_mut(half, N_CELLS - half).fill(1.0);
+
+    (rho0, u0, p0)
+}
+
+fn supersonic_expansion_test() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
+    println!("Configuration 1: Sod's problem.");
+
+    let mut rho0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let mut u0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let mut p0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let half = N_CELLS / 2;
+
+    //left
+    rho0.columns_mut(0, half).fill(1.0);
+    u0.columns_mut(0, half).fill(-2.0);
+    p0.columns_mut(0, half).fill(3.0);
+
+    //right
+    rho0.columns_mut(half, N_CELLS - half).fill(1.0);
+    u0.columns_mut(half, N_CELLS - half).fill(2.0);
+    p0.columns_mut(half, N_CELLS - half).fill(3.0);
+
+    (rho0, u0, p0)
+}
+
 fn main() {
     unsafe {
         env::set_var("RUST_BACKTRACE", "full");
     }
 
-    let (rho0, u0, p0) = sods_problem();
+    let (rho0, u0, p0) = supersonic_expansion_test();
 
     //initial total energy
     let e_tot0 = p0.component_div(&((GAMMA - 1.0) * &rho0)) + 0.5 * u0.component_mul(&u0);
 
     //initial speed of sound
     let a0: Matrix1xX<f64> = (GAMMA * p0.component_div(&rho0)).map(|x| x.sqrt());
+
+    // initial specific total enthalpy
+    let mut h: Matrix1xX<f64> = &e_tot0 + p0.component_div(&rho0);
 
     //time step
     let mut dt = COURANT * DX / max_wave_speed(&u0, &a0);
@@ -225,7 +339,6 @@ fn main() {
     let mut u: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
     let mut e: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
     let mut p: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let mut h: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
 
     println!("Beginning Simulation:");
 
@@ -249,7 +362,7 @@ fn main() {
         it += 1;
 
         //update timestep
-        decode_state(&q1, &mut rho, &mut u, &mut e, &mut p);
+        decode_state(&q1, &mut rho, &mut u, &mut e, &mut p, &mut h);
 
         // a = sqrt(gamma * p / rho), computed in place to avoid allocation
         a.copy_from(&p);
@@ -262,13 +375,20 @@ fn main() {
         dt = COURANT * DX / max_wave_speed(&u, &a);
         dt = dt.min(T_END - t);
 
+
+        //NaN check
+        if rho.iter().any(|&x| x < 0.0) || p.iter().any(|&x| x < 0.0) {
+            panic!("NANANNANANNANAN");
+        }
+
+
         //display pressure along the pipe
         println!("Iteration {}", it);
         let points: Vec<(f32, f32)> = x
             .iter()
             .copied()
             .map(|y| y as f32)
-            .zip(p.iter().copied().map(|y| y as f32))
+            .zip(rho.iter().copied().map(|y| y as f32))
             .collect();
         Chart::new_with_y_range(100, 100, 0.0, 1.0, 0.0, 1.0)
             .lineplot(&Shape::Points(points.as_slice()))
