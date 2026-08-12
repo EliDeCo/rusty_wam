@@ -1,225 +1,228 @@
-use nalgebra::{Matrix3,Matrix3x1};
-use ndarray::{Array1, Array2, Axis, linspace, parallel::prelude::*, s};
+use nalgebra::{Matrix1xX, Matrix3, Matrix3x1, Matrix3xX};
+use ndarray::linspace;
 use std::env;
 use textplots::{Chart, Plot, Shape};
 
 //Parameters
-const COURANT: f64 = 1.0; //CFL courant number
+const COURANT: f64 = 0.9; //CFL courant number
 const GAMMA: f64 = 1.4; //ratio if specific heats
 const T_END: f64 = 1.0; //how much virtual time to run the simulation
-const N_CELLS: f64 = 400.0;
+const N_CELLS: usize = 2048;
+const N_INTERFACES: usize = N_CELLS - 1; //number of interfaces between cells (boundaries don't count)
+const N_INTERIOR: usize = N_CELLS - 2; //number of interior (non boundary) cells
 const DOMAIN_LENGTH: f64 = 1.0; //basically how long the pipe is
-const DX: f64 = DOMAIN_LENGTH / N_CELLS; //step size
-const N_BOUNDARIES: usize = N_CELLS as usize + 1;
+const DX: f64 = DOMAIN_LENGTH / N_CELLS as f64; //step size
 
 ///decodes the state vector into primitives of the conserved variables:
 /// rho (density), u (velocity), e (specific total energy), p (pressure)
-/// They are vectors of length nx, where nx is the number of grid points in the simulation domain
+/// They are vectors with one value per finite-volume cell
 fn decode_state(
-    q: &Array2<f64>,
+    q: &Matrix3xX<f64>,
     gamma: f64,
 ) -> (
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
+    Matrix1xX<f64>,
+    Matrix1xX<f64>,
+    Matrix1xX<f64>,
+    Matrix1xX<f64>,
 ) {
-    let rho: Array1<f64> = q.row(0).to_owned();
-    let rho_inv: Array1<f64> = 1.0 / &rho;
-    let u: Array1<f64> = &q.row(1) * &rho_inv;
-    let e: Array1<f64> = &q.row(2) * &rho_inv; // specific total energy, NOT specific internal energy
-    let p: Array1<f64> = (gamma - 1.0) * &rho * (&e - 0.5 * &u * &u); // pressure from equation of state
+    let rho: Matrix1xX<f64> = q.row(0).clone_owned();
+    let u: Matrix1xX<f64> = q.row(1).component_div(&rho); //velocity
+    let e: Matrix1xX<f64> = q.row(2).component_div(&rho); // specific total energy, NOT specific internal energy
+    let p: Matrix1xX<f64> = (gamma - 1.0) * &rho.component_mul(&(&e - 0.5 * &u.component_mul(&u))); // pressure from equation of state
 
-    (rho, rho_inv, u, e, p)
+    (rho, u, e, p)
 }
 
-///Calculates the Euler flux (F) for ever cell given state vector q and specific heat ratio gamma.
+///Calculates the Euler flux (F) for every cell given state vector q and specific heat ratio gamma.
 /// q = [rho, rho*u, rho*E] where rho is the density, u is the velocity, and E is the total specific energy.
 /// F = [rho*u, rho*u^2 + p, u*(rho*E + p)] where p is the pressure calculated from the equation of state.
-fn euler_flux(q: &Array2<f64>, gamma: f64) -> Array2<f64> {
-    let (rho, _, u, e, p) = decode_state(q, gamma);
+fn euler_flux(q: &Matrix3xX<f64>, gamma: f64) -> Matrix3xX<f64> {
+    let (rho, u, e, p) = decode_state(q, gamma);
 
-    let flux: Array2<f64> = Array2::from_shape_fn((3, q.ncols()), |(i, j)| {
+    Matrix3xX::from_fn(N_CELLS, |i, j| {
         match i {
             0 => rho[j] * u[j],                 // mass flux
             1 => rho[j] * u[j] * u[j] + p[j],   // momentum flux
             2 => u[j] * (rho[j] * e[j] + p[j]), // energy flux
             _ => panic!("Invalid index for flux calculation"),
         }
-    });
-
-    flux
+    })
 }
-//TODO: Remove extra allocations
 ///Calculates the Roe flux for every cell given the state vector q and specific heat ratio gamma.
-fn roe_flux(q: &Array2<f64>, gamma: f64, n: usize) -> Array2<f64> {
-    let (rho, rho_inv, u, e, p) = decode_state(q, gamma);
-    let h: Array1<f64> = e + p * &rho_inv; // specific total enthalpy
+fn roe_flux(q: &Matrix3xX<f64>, gamma: f64) -> Matrix3xX<f64> {
+    let (rho, u, e, p) = decode_state(q, gamma);
+    let h: Matrix1xX<f64> = e + p.component_div(&rho); // specific total enthalpy
 
     //initialize roe flux
-    let mut phi: Array2<f64> = Array2::zeros((3, n - 1));
+    let mut phi: Matrix3xX<f64> = Matrix3xX::zeros(N_INTERFACES);
+    let mut new_col: Matrix3x1<f64> = Matrix3x1::zeros();
 
-    //loop over each cell boundary (column in phi)
-    phi.axis_iter_mut(Axis(1))
-        .into_par_iter()
-        .enumerate()
-        .for_each(|(i, mut col)| {
-            //intermediate quanties
-            let r = (rho[i + 1] * rho_inv[i]).sqrt();
+    //loop over each cell interface (column in phi)
+    phi.column_iter_mut().enumerate().for_each(|(i, mut col)| {
+        //intermediate quanties
+        let r = (rho[i + 1] / rho[i]).sqrt();
 
-            //Roe averages
-            //let roe_rho = r * rho[i]; // Roe average density, unused in flux calculation
-            let roe_u = (r * u[i + 1] + u[i]) / (r + 1.0); // Roe average velocity
-            let half_roe_u_squared = 0.5 * roe_u * roe_u; //intermediate quantity
-            let roe_h = (r * h[i + 1] + h[i]) / (r + 1.0); // Roe average specific total enthalpy
-            let roe_a = ((gamma - 1.0) * (roe_h - half_roe_u_squared)).sqrt(); // Roe average speed of sound
+        //Roe averages
+        //let roe_rho = r * rho[i]; // Roe average density, unused in flux calculation
+        let roe_u = (r * u[i + 1] + u[i]) / (r + 1.0); // Roe average velocity
+        let half_roe_u_squared = 0.5 * roe_u * roe_u; //intermediate quantity
+        let roe_h = (r * h[i + 1] + h[i]) / (r + 1.0); // Roe average specific total enthalpy
+        let roe_a = ((gamma - 1.0) * (roe_h - half_roe_u_squared)).sqrt(); // Roe average speed of sound
 
-            //difference between neighboring cell states
-            let dq: Matrix3x1<f64> = Matrix3x1::new(
-                q[[0, i + 1]] - q[[0, i]], // d(rho)
-                q[[1, i + 1]] - q[[1, i]], // d(rho*u)
-                q[[2, i + 1]] - q[[2, i]], // d(rho*E)
-            );
+        //difference between neighboring cell states
+        let dq: Matrix3x1<f64> = Matrix3x1::new(
+            q[(0, i + 1)] - q[(0, i)], // d(rho)
+            q[(1, i + 1)] - q[(1, i)], // d(rho*u)
+            q[(2, i + 1)] - q[(2, i)], // d(rho*E)
+        );
 
-            //Eigenvalues
-            let lambda: [f64; 3] = [roe_u - roe_a, roe_u, roe_u + roe_a];
+        //Eigenvalues
+        let lambda: [f64; 3] = [roe_u - roe_a, roe_u, roe_u + roe_a];
 
-            //Eigenvector matrix P
-            let p_matrix: Matrix3<f64> = Matrix3::new(
-                1.0,
-                1.0,
-                1.0,
-                lambda[0],
-                lambda[1],
-                lambda[2],
-                roe_h - roe_u * roe_a,
-                half_roe_u_squared,
-                roe_h + roe_u * roe_a,
-            );
+        //Eigenvector matrix P
+        let p_matrix: Matrix3<f64> = Matrix3::new(
+            1.0,
+            1.0,
+            1.0,
+            lambda[0],
+            lambda[1],
+            lambda[2],
+            roe_h - roe_u * roe_a,
+            half_roe_u_squared,
+            roe_h + roe_u * roe_a,
+        );
 
-            //more intermediate quantities
-            let alpha2 = (gamma - 1.0) / (roe_a * roe_a);
-            let alpha1 = alpha2 * half_roe_u_squared;
-            let alpha3 = 0.5 / roe_a;
+        //more intermediate quantities
+        let alpha2 = (gamma - 1.0) / (roe_a * roe_a);
+        let alpha1 = alpha2 * half_roe_u_squared;
+        let alpha3 = 0.5 / roe_a;
 
-            let p_matrix_inv: Matrix3<f64> = Matrix3::new(
-                    alpha3 * roe_u + 0.5 * alpha1,
-                    -alpha3 - alpha2 * roe_u * 0.5,
-                    alpha2 * 0.5,
-                    1.0 - alpha1,
-                    alpha2 * roe_u,
-                    -alpha2,
-                    -alpha3 * roe_u + 0.5 * alpha1,
-                    alpha3 - alpha2 * roe_u * 0.5,
-                    alpha2 * 0.5,
-            );
+        let p_matrix_inv: Matrix3<f64> = Matrix3::new(
+            alpha3 * roe_u + 0.5 * alpha1,
+            -alpha3 - alpha2 * roe_u * 0.5,
+            alpha2 * 0.5,
+            1.0 - alpha1,
+            alpha2 * roe_u,
+            -alpha2,
+            -alpha3 * roe_u + 0.5 * alpha1,
+            alpha3 - alpha2 * roe_u * 0.5,
+            alpha2 * 0.5,
+        );
 
-            //Eigenvalue matrix
-            let lambda_matrix: Matrix3<f64> = Matrix3::new(
-                    lambda[0].abs(),
-                    0.0,
-                    0.0,
-                    0.0,
-                    lambda[1].abs(),
-                    0.0,
-                    0.0,
-                    0.0,
-                    lambda[2].abs(),
-            );
+        //Eigenvalue matrix
+        let lambda_matrix: Matrix3<f64> = Matrix3::new(
+            lambda[0].abs(),
+            0.0,
+            0.0,
+            0.0,
+            lambda[1].abs(),
+            0.0,
+            0.0,
+            0.0,
+            lambda[2].abs(),
+        );
 
-            //Roe flux jacobian (the 3x3 matrix, constructed from its diagonalization)
-            let a: Matrix3<f64> = p_matrix * lambda_matrix * p_matrix_inv;
+        //Roe flux jacobian (the 3x3 matrix, constructed from its diagonalization)
+        let a: Matrix3<f64> = p_matrix * lambda_matrix * p_matrix_inv;
 
-            let product: Array1<f64> = Array1::from_vec((a * dq).as_slice().to_vec());
-
-            //update roe flux
-            col.assign(&product);
-        });
+        //update roe flux
+        new_col = a * dq;
+        for j in 0..3 {
+            col[j] = new_col[j]
+        }
+    });
 
     //get physical (euler) flux
-    let f: Array2<f64> = euler_flux(q, gamma);
+    let f: Matrix3xX<f64> = euler_flux(q, gamma);
 
     //Roe numerical flux (phi is currently just 2 * the upwind dissipation, need to divide by 2 and add central flux)
-    phi = 0.5 * (&f.slice(s![.., 0..(n - 1)]) + &f.slice(s![.., 1..n]) - phi);
+    phi = 0.5 * (f.columns(0, N_INTERFACES) + f.columns(1, N_INTERFACES) - phi);
 
     //Final flux differerence
-    let df: Array2<f64> = &phi.slice(s![.., 1..(-1)]) - &phi.slice(s![.., 0..(-2)]);
-
-    df
+    phi.columns(1, N_INTERIOR) - phi.columns(0, N_INTERIOR)
 }
 
 /// Left pressure = 1, right pressure = 0.1.
 /// Left density = 1, right density = 0.125.
 /// Velocity is 0 everywhere
-fn sods_problem() -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+fn sods_problem() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
     println!("Configuration 1: Sod's problem.");
 
-    let mut rho0: Array1<f64> = Array1::zeros(N_BOUNDARIES);
-    let u0: Array1<f64> = Array1::zeros(N_BOUNDARIES);
-    let mut p0: Array1<f64> = Array1::zeros(N_BOUNDARIES);
-    let half = (0.5 * N_CELLS) as usize;
+    let mut rho0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let u0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let mut p0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let half = N_CELLS / 2;
 
     //left
-    rho0.slice_mut(s![0..half]).fill(1.0);
-    p0.slice_mut(s![0..half]).fill(1.0);
+    rho0.columns_mut(0, half).fill(1.0);
+    p0.columns_mut(0, half).fill(1.0);
 
     //right
-    rho0.slice_mut(s![half..]).fill(0.125);
-    p0.slice_mut(s![half..]).fill(0.1);
+    rho0.columns_mut(half, N_CELLS - half).fill(0.125);
+    p0.columns_mut(half, N_CELLS - half).fill(0.1);
 
     (rho0, u0, p0)
 }
 
 fn main() {
     unsafe {
-        env::set_var("RUST_BACKTRACE", "1");
+        env::set_var("RUST_BACKTRACE", "full");
     }
 
     let (rho0, u0, p0) = sods_problem();
 
     //initial total energy
-    let e_tot0: Array1<f64> = &p0 / ((GAMMA - 1.0) * &rho0) + 0.5 * &u0 * &u0;
+    let e_tot0 = p0.component_div(&((GAMMA - 1.0) * &rho0)) + 0.5 * u0.component_mul(&u0);
 
     //initial speed of sound
-    let a0: Array1<f64> = (GAMMA * &p0 / &rho0).sqrt();
+    let a0: Matrix1xX<f64> = (GAMMA * p0.component_div(&rho0)).map(|x| x.sqrt());
 
     //time step
     let mut dt = COURANT * DX / ((&u0).abs() + &a0).iter().fold(0.0_f64, |a, &b| a.max(b));
 
-    //construct conservative state vector
-    let mut q: Array2<f64> = Array2::zeros((3, N_BOUNDARIES));
-    q.row_mut(0).assign(&rho0);
-    q.row_mut(1).assign(&(&rho0 * u0));
-    q.row_mut(2).assign(&(rho0 * e_tot0));
+    //construct conservative state vector (past copy)
+    let mut q0: Matrix3xX<f64> = Matrix3xX::zeros(N_CELLS);
+    q0.set_row(0, &rho0);
+    q0.set_row(1, &(&rho0.component_mul(&u0)));
+    q0.set_row(2, &(&rho0.component_mul(&e_tot0)));
+
+    //working copy
+    let mut q1: Matrix3xX<f64> = q0.to_owned();
 
     let mut t: f64 = 0.0;
     let mut it: u32 = 0;
 
-    let x: Vec<f64> = linspace(DX / 2., 1.0, N_BOUNDARIES).into_iter().collect();
+    let x: Vec<f64> = linspace(DX / 2., 1.0, N_CELLS).into_iter().collect();
+
+    //assigned now to avoid repeated allocation
+    let mut df: Matrix3xX<f64> = Matrix3xX::zeros(N_INTERIOR);
+    let mut a: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
 
     println!("Beginning Simulation:");
 
     while t < T_END {
         //println!("Iteration: {}, t = {}", it, t);
 
-        //copy old solution
-        let q0: Array2<f64> = q.clone();
+        //move current solution to previous solution buffer
+        q0.copy_from(&q1);
 
         //calculate change in flux (flux divergence)
-        let df: Array2<f64> = roe_flux(&q0, GAMMA, N_BOUNDARIES);
+        df.copy_from(&roe_flux(&q0, GAMMA));
 
-        //finite volume update (not that the boundaries (0 and -1) are unchanged)
-        q.slice_mut(s![.., 1..(-2)])
-            .assign(&(q0.slice(s![.., 1..(-2)]).to_owned() - (dt / DX) * df));
-
-        //update timestep
-        let (_, rho_inv, u, _, p) = decode_state(&q, GAMMA);
-        let a: Array1<f64> = (GAMMA * &p * &rho_inv).sqrt();
-        dt = COURANT * DX / ((&u).abs() + &a).iter().fold(0.0_f64, |a, &b| a.max(b));
+        //finite volume update (the first and last cells are fixed boundary cells)
+        q1.columns_mut(1, N_INTERIOR)
+            .copy_from(&(q0.columns(1, N_INTERIOR) - (dt / DX) * &df));
 
         t += dt;
         it += 1;
+
+        //update timestep
+        let (rho, u, _, p) = decode_state(&q1, GAMMA);
+        a.copy_from(&(GAMMA * p.component_div(&rho)).map(|x| x.sqrt()));
+        dt = COURANT * DX / ((&u).abs() + &a).iter().fold(0.0_f64, |a, &b| a.max(b));
+        dt = dt.min(T_END - t);
+
+
 
         //display pressure along the pipe
         println!("Iteration {}", it);
