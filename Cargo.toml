@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 nalgebra = "0.35.0"
-ndarray = {version = "0.17.2"}
 textplots = "0.8.7"
 
 [profile.release]
