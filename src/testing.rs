@@ -5,8 +5,8 @@ ENABLE_CLIP toggle those tests need. Nothing in here is exercised by a normal
 (non-testing) run of the solver -- see main.rs's run_default() for that.
 */
 use crate::{
-    apply_bc, decode_state, max_wave_speed, ssprk3_step, BoundaryCondition, Decoded, Workspace,
-    COURANT, DX, FIRST, GAMMA, N_CELLS, N_TOTAL, T_END,
+    BoundaryCondition, COURANT, DX, Decoded, FIRST, GAMMA, N_CELLS, N_TOTAL, T_END, Workspace,
+    apply_bc, decode_state, max_wave_speed, ssprk3_step,
 };
 use nalgebra::{Matrix1xX, Matrix3xX};
 use std::f64::consts::PI;
@@ -219,7 +219,13 @@ fn pack_real_cells_into_padded(
 ///Recomputes dt from the current padded state, exactly mirroring the CFL update
 /// inside the main time loop -- pulled out so the Phase 8 drivers below don't each
 /// re-derive it.
-fn cfl_dt(q: &Matrix3xX<f64>, cells: &mut Decoded, a: &mut Matrix1xX<f64>, t_end: f64, t: f64) -> f64 {
+fn cfl_dt(
+    q: &Matrix3xX<f64>,
+    cells: &mut Decoded,
+    a: &mut Matrix1xX<f64>,
+    t_end: f64,
+    t: f64,
+) -> f64 {
     decode_state(q, cells);
     a.copy_from(&cells.p);
     a.component_div_assign(&cells.rho);
@@ -256,7 +262,14 @@ pub fn run_order_test() {
 
     while t < t_end_local {
         ssprk3_step(
-            &mut q1, &mut q_stage1, &mut q_stage2, &mut dq_dt, &mut ws, dt, left_bc, right_bc,
+            &mut q1,
+            &mut q_stage1,
+            &mut q_stage2,
+            &mut dq_dt,
+            &mut ws,
+            dt,
+            left_bc,
+            right_bc,
         );
         t += dt;
         dt = cfl_dt(&q1, &mut cells, &mut a, t_end_local, t);
@@ -305,7 +318,14 @@ pub fn run_gaussian_pulse() {
 
     while t < T_END {
         ssprk3_step(
-            &mut q1, &mut q_stage1, &mut q_stage2, &mut dq_dt, &mut ws, dt, left_bc, right_bc,
+            &mut q1,
+            &mut q_stage1,
+            &mut q_stage2,
+            &mut dq_dt,
+            &mut ws,
+            dt,
+            left_bc,
+            right_bc,
         );
         t += dt;
         it += 1;
@@ -374,7 +394,14 @@ fn run_regression_case(
 
     while t < T_END {
         ssprk3_step(
-            &mut q1, &mut q_stage1, &mut q_stage2, &mut dq_dt, &mut ws, dt, left_bc, right_bc,
+            &mut q1,
+            &mut q_stage1,
+            &mut q_stage2,
+            &mut dq_dt,
+            &mut ws,
+            dt,
+            left_bc,
+            right_bc,
         );
         t += dt;
         it += 1;

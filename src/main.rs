@@ -1,5 +1,5 @@
 /*
-This code was originally based on P. S. Volpiani's Roe example
+This code was originally based on P. S. Volpiani's Roe example (07_cfd.py)
 https://github.com/psvolpiani/YouTube-CFD-101/tree/main/07_1D_Euler_equations_Roe
 
 The main interior solver scheme is a 1D version of the RoeM2 scheme from the following paper,
@@ -17,18 +17,16 @@ use textplots::{Chart, Plot, Shape};
 mod testing;
 
 //Input Parameters
-const COURANT: f64 = 0.5; //CFL courant number
+const COURANT: f64 = 0.9; //CFL courant number
 const GAMMA: f64 = 1.4; //ratio of specific heats
 const T_END: f64 = 3.0; //how much virtual time to run the simulation
 const KAPPA: f64 = 1.0 / 3.0; // MUSCL blend parameter
-const N_CELLS: usize = 1024; //number of REAL (non ghost) cells
+const N_CELLS: usize = 2048; //number of REAL (non ghost) cells
 const N_GHOST: usize = 2; //ghost cells of each side
 const DOMAIN_LENGTH: f64 = 1.0; //basically how long the pipe is
-const RECONSTRUCT_PRIMITIVE: bool = false; // false = reconstruct conserved (verified 3rd order); 
-// true = reconstruct primitive
-// (more robust, expect ~2nd order on nonlinear
-// problems -- see LaTeX section)
-// ENABLE_CLIP lives in testing.rs -- it's a verification-only toggle, not a solver parameter.
+const RECONSTRUCT_PRIMITIVE: bool = false;
+// false = reconstruct conserved (verified 3rd order);
+// true = reconstruct primitive (more robust, expect ~2nd order on nonlinear problems)
 
 //Calculated Parameters
 const C_M: f64 = (1.0 - KAPPA) / 4.0; // weight on the "backward" difference
@@ -163,7 +161,7 @@ fn decode_state(q: &Matrix3xX<f64>, w: &mut Decoded) {
     w.p.copy_from(&w.u);
     w.p.component_mul_assign(&w.u); // p = u*u
     w.p *= -0.5; // p = -0.5*u*u
-    w.p.add_assign(&w.e); // p = e - 0.5*u*u   (reborrow e as &Matrix1xX)
+    w.p.add_assign(&w.e); // p = e - 0.5*u*u
     w.p.component_mul_assign(&w.rho); // p = rho*(e - 0.5*u*u)
     w.p *= GAMMA - 1.0; // p = (γ-1)*rho*(e - 0.5*u*u)
 
@@ -267,9 +265,9 @@ struct Workspace {
     prim: Matrix3xX<f64>, // N_TOTAL -- only touched when RECONSTRUCT_PRIMITIVE
     w_l: Matrix3xX<f64>,  // N_FACES -- primitive-form face states, pre-conversion
     w_r: Matrix3xX<f64>,  // N_FACES
-    // fallback_count: usize, // testing-only: running total of enforce_positivity fires
-    // across the whole run, read by testing::run_regression_case. Not core solver state --
-    // commented out rather than moved since Workspace itself must stay in main.rs.
+                          // fallback_count: usize, // testing-only: running total of enforce_positivity fires
+                          // across the whole run, read by testing::run_regression_case. Not core solver state --
+                          // commented out rather than moved since Workspace itself must stay in main.rs.
 }
 
 impl Workspace {
@@ -465,30 +463,32 @@ fn ssprk3_step(
     q: &mut Matrix3xX<f64>,
     q1: &mut Matrix3xX<f64>,
     q2: &mut Matrix3xX<f64>,
-    res: &mut Matrix3xX<f64>,
+    dq_dt: &mut Matrix3xX<f64>,
     ws: &mut Workspace,
     dt: f64,
     left_bc: BoundaryCondition,
     right_bc: BoundaryCondition,
 ) {
     // Stage 1: q1 = q^n + dt * R(q^n)   -- an ordinary forward-Euler step
-    residual(q, ws, res);
-    let stage1 = q.columns(FIRST, N_CELLS) + dt * &*res;
-    q1.columns_mut(FIRST, N_CELLS).copy_from(&stage1);
+    residual(q, ws, dq_dt);
+    q1.columns_mut(FIRST, N_CELLS)
+        .copy_from(&(q.columns(FIRST, N_CELLS) + dt * &*dq_dt));
     apply_bc(q1, left_bc, right_bc);
 
     // Stage 2: q2 = 3/4 q^n + 1/4 (q1 + dt * R(q1))
-    residual(q1, ws, res);
-    let euler2 = q1.columns(FIRST, N_CELLS) + dt * &*res;
-    let stage2 = 0.75 * q.columns(FIRST, N_CELLS) + 0.25 * euler2;
-    q2.columns_mut(FIRST, N_CELLS).copy_from(&stage2);
+    residual(q1, ws, dq_dt);
+    q2.columns_mut(FIRST, N_CELLS).copy_from(
+        &(0.75 * q.columns(FIRST, N_CELLS) + 0.25 * (q1.columns(FIRST, N_CELLS) + dt * &*dq_dt)),
+    );
     apply_bc(q2, left_bc, right_bc);
 
     // Stage 3: q^{n+1} = 1/3 q^n + 2/3 (q2 + dt * R(q2))
-    residual(q2, ws, res);
-    let euler3 = q2.columns(FIRST, N_CELLS) + dt * &*res;
-    let final_state = (1.0 / 3.0) * q.columns(FIRST, N_CELLS) + (2.0 / 3.0) * euler3;
-    q.columns_mut(FIRST, N_CELLS).copy_from(&final_state);
+    //copy into q1 first to avoid borrowing q as mutable and immutable simultaneously
+    residual(q2, ws, dq_dt);
+    q1.columns_mut(FIRST, N_CELLS).copy_from(&((1.0 / 3.0) * q.columns(FIRST, N_CELLS)
+        + (2.0 / 3.0) * (q2.columns(FIRST, N_CELLS) + dt * &*dq_dt)));
+    q.columns_mut(FIRST, N_CELLS).copy_from(&q1.columns(FIRST, N_CELLS));
+
     apply_bc(q, left_bc, right_bc);
 }
 
@@ -548,15 +548,13 @@ fn enforce_positivity(
     for k in 0..N_FACES {
         let (rho_l, p_l) = rho_p_of(&q_l.column(k).into_owned());
         if rho_l <= 0.0 || p_l <= 0.0 {
-            let fallback = q.column(k + 1).into_owned(); // cell average of face k's left cell
-            q_l.set_column(k, &fallback);
+            q_l.set_column(k, &(q.column(k + 1).into_owned()));
             count += 1;
         }
 
         let (rho_r, p_r) = rho_p_of(&q_r.column(k).into_owned());
         if rho_r <= 0.0 || p_r <= 0.0 {
-            let fallback = q.column(k + 2).into_owned(); // cell average of face k's right cell
-            q_r.set_column(k, &fallback);
+            q_r.set_column(k, &(q.column(k + 2).into_owned()));
             count += 1;
         }
     }
