@@ -4,16 +4,8 @@ battery, the Phase 8 order-of-accuracy + shape-preservation apparatus, and the
 ENABLE_CLIP toggle those tests need. Nothing in here is exercised by a normal
 (non-testing) run of the solver -- see main.rs's run_default() for that.
 */
-use crate::{
-    BoundaryCondition, COURANT, DX, Decoded, FIRST, GAMMA, N_CELLS, N_TOTAL, T_END, Workspace,
-    apply_bc, decode_state, max_wave_speed, ssprk3_step,
-};
-use nalgebra::{Matrix1xX, Matrix3xX};
-use std::f64::consts::PI;
-
-/// false reproduces unlimited kappa=1/3 exactly -- needed for the order test, which
-/// must measure the UNLIMITED scheme to see slope 3.
-pub const ENABLE_CLIP: bool = true;
+use crate::N_TOTAL;
+use nalgebra::Matrix1xX;
 
 ///TESTS=============================================
 /// Left pressure = 1, right pressure = 0.1.
@@ -34,6 +26,17 @@ fn _sods_problem() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
     //right
     rho0.columns_mut(half, N_TOTAL - half).fill(0.125);
     p0.columns_mut(half, N_TOTAL - half).fill(0.1);
+
+    (rho0, u0, p0)
+}
+
+/// At rest
+pub fn at_rest() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
+    println!("Pipe at rest.");
+
+    let rho0: Matrix1xX<f64> = Matrix1xX::from_element(N_TOTAL, 1.0);
+    let u0: Matrix1xX<f64> = Matrix1xX::zeros(N_TOTAL);
+    let p0: Matrix1xX<f64> = Matrix1xX::from_element(N_TOTAL, 1.0);
 
     (rho0, u0, p0)
 }
@@ -122,6 +125,7 @@ pub fn density_pulse_test() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) 
     (rho0, u0, p0)
 }
 
+/*
 // Phase 8: verification apparatus. Two new test ICs (smooth periodic entropy wave,
 // Gaussian pulse) plus the error/order machinery needed to turn "looks about right"
 // into an actual measured number.
@@ -235,7 +239,7 @@ fn cfl_dt(
     }
     (COURANT * DX / max_wave_speed(&cells.u, a)).min(t_end - t)
 }
-
+ 
 /// Phase 8, step 1: order-of-accuracy sweep driver. Runs the periodic entropy wave to
 /// T_END=0.1 (short -- only the spatial order is being measured) at whatever N_CELLS /
 /// ENABLE_CLIP the binary was built with, and prints a single grep-able RESULT line.
@@ -461,3 +465,4 @@ pub fn run_regression_suite() {
         BoundaryCondition::Transmissive,
     );
 }
+*/

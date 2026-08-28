@@ -13,8 +13,11 @@ https://doi.org/10.22055/jacm.2020.32845.2088
 use nalgebra::{Matrix1xX, Matrix3, Matrix3x1, Matrix3xX};
 use std::ops::AddAssign;
 use textplots::{Chart, Plot, Shape};
+use std::collections::HashMap;
 
+mod junctions;
 mod testing;
+use junctions::*;
 
 //Input Parameters
 const COURANT: f64 = 0.9; //CFL courant number
@@ -24,6 +27,11 @@ const KAPPA: f64 = 1.0 / 3.0; // MUSCL blend parameter
 const N_CELLS: usize = 2048; //number of REAL (non ghost) cells
 const N_GHOST: usize = 2; //ghost cells of each side
 const DOMAIN_LENGTH: f64 = 1.0; //basically how long the pipe is
+
+//temporary for junction testing
+const N_PIPES: usize = 2;
+const JUNCTION_ID: usize = N_PIPES + 1; //next free id
+
 const RECONSTRUCT_PRIMITIVE: bool = false;
 // false = reconstruct conserved (verified 3rd order);
 // true = reconstruct primitive (more robust, expect ~2nd order on nonlinear problems)
@@ -61,60 +69,31 @@ fn compute_windows(q: &Matrix3xX<f64>, qmin: &mut Matrix3xX<f64>, qmax: &mut Mat
 enum BoundaryCondition {
     /// zero-gradient: waves pass through the ends undisturbed
     Transmissive,
-    /// domain wraps on itself: left edge feeds from the right edge
-    Periodic,
-    /// solid wall: normal velocity forced to zero at the boundary, reflecting pressure waves inward
-    Reflecting,
 }
 
 ///Fills the ghost cells surrounding the real domain so every real cell — including the
 /// two nearest each edge — can be updated with the exact same 4-cell stencil.
 /// left/right are independent so e.g. a closed-end shock tube (wall + transmissive)
 /// can be built from the same function.
-fn apply_bc(q: &mut Matrix3xX<f64>, left: BoundaryCondition, right: BoundaryCondition) {
+fn apply_bc(q: &mut Matrix3xX<f64>, left: Option<BoundaryCondition>, right: Option<BoundaryCondition>) {
     match left {
-        BoundaryCondition::Transmissive => {
+        Some(BoundaryCondition::Transmissive) => {
             for g in 0..N_GHOST {
                 let mirror = q.column(FIRST).into_owned();
                 q.set_column(g, &mirror);
             }
-        }
-        BoundaryCondition::Periodic => {
-            for g in 0..N_GHOST {
-                let from_right = q.column(FIRST + N_CELLS - N_GHOST + g).into_owned();
-                q.set_column(g, &from_right);
-            }
-        }
-        BoundaryCondition::Reflecting => {
-            for g in 1..=N_GHOST {
-                // ghost cell g away from the wall mirrors the real cell g away from the wall
-                let mut mirror = q.column(FIRST + g - 1).into_owned();
-                mirror[1] = -mirror[1]; // rho*u flips sign; rho and rho*E are unchanged
-                q.set_column(FIRST - g, &mirror);
-            }
-        }
+        },
+        _ => {}
     }
 
     match right {
-        BoundaryCondition::Transmissive => {
+        Some(BoundaryCondition::Transmissive) => {
             for g in 0..N_GHOST {
                 let mirror = q.column(FIRST + N_CELLS - 1).into_owned();
                 q.set_column(N_TOTAL - 1 - g, &mirror);
             }
-        }
-        BoundaryCondition::Periodic => {
-            for g in 0..N_GHOST {
-                let from_left = q.column(FIRST + g).into_owned();
-                q.set_column(N_TOTAL - N_GHOST + g, &from_left);
-            }
-        }
-        BoundaryCondition::Reflecting => {
-            for g in 1..=N_GHOST {
-                let mut mirror = q.column(FIRST + N_CELLS - g).into_owned();
-                mirror[1] = -mirror[1]; // rho*u flips sign
-                q.set_column(FIRST + N_CELLS - 1 + g, &mirror);
-            }
-        }
+        },
+        _ => {}
     }
 }
 
@@ -239,14 +218,25 @@ fn reconstruct(
 
     // clamp the generated left and right states based on the limits defined by compute_windows
     // in order to stop nonsphysical information spread
-    if testing::ENABLE_CLIP {
-        for row in 0..3 {
-            for k in 0..N_FACES {
-                q_l[(row, k)] = q_l[(row, k)].clamp(qmin[(row, k)], qmax[(row, k)]);
-                q_r[(row, k)] = q_r[(row, k)].clamp(qmin[(row, k + 1)], qmax[(row, k + 1)]);
-            }
+    for row in 0..3 {
+        for k in 0..N_FACES {
+            q_l[(row, k)] = q_l[(row, k)].clamp(qmin[(row, k)], qmax[(row, k)]);
+            q_r[(row, k)] = q_r[(row, k)].clamp(qmin[(row, k + 1)], qmax[(row, k + 1)]);
         }
     }
+}
+
+//all the information for a single pipe
+struct Pipe {
+    workspace: Workspace,
+    q1: Matrix3xX<f64>,
+    q_stage1: Matrix3xX<f64>,
+    q_stage2: Matrix3xX<f64>,
+    dq_dt: Matrix3xX<f64>,
+    left_bc: Option<BoundaryCondition>,
+    right_bc: Option<BoundaryCondition>,
+    cells: Decoded,
+    x: Vec<f64>,
 }
 
 ///Scratch buffers for one residual evaluation, sized once outside the time loop
@@ -265,9 +255,6 @@ struct Workspace {
     prim: Matrix3xX<f64>, // N_TOTAL -- only touched when RECONSTRUCT_PRIMITIVE
     w_l: Matrix3xX<f64>,  // N_FACES -- primitive-form face states, pre-conversion
     w_r: Matrix3xX<f64>,  // N_FACES
-                          // fallback_count: usize, // testing-only: running total of enforce_positivity fires
-                          // across the whole run, read by testing::run_regression_case. Not core solver state --
-                          // commented out rather than moved since Workspace itself must stay in main.rs.
 }
 
 impl Workspace {
@@ -446,7 +433,6 @@ fn residual(q: &Matrix3xX<f64>, ws: &mut Workspace, dq_dt: &mut Matrix3xX<f64>) 
         reconstruct(q, &ws.dq, &mut ws.q_l, &mut ws.q_r, &ws.qmin, &ws.qmax); //reconstructs q_l and q_r using peicewise linear scheme
     }
 
-    // ws.fallback_count += ... -- testing-only counter, see Workspace's commented-out field
     enforce_positivity(q, &mut ws.q_l, &mut ws.q_r); // last line of defense before the flux
 
     roe_flux(&ws.q_l, &ws.q_r, &mut ws.wl, &mut ws.wr, &mut ws.phi); //calculates the roe flux through each face
@@ -466,8 +452,8 @@ fn ssprk3_step(
     dq_dt: &mut Matrix3xX<f64>,
     ws: &mut Workspace,
     dt: f64,
-    left_bc: BoundaryCondition,
-    right_bc: BoundaryCondition,
+    left_bc: Option<BoundaryCondition>,
+    right_bc: Option<BoundaryCondition>,
 ) {
     // Stage 1: q1 = q^n + dt * R(q^n)   -- an ordinary forward-Euler step
     residual(q, ws, dq_dt);
@@ -480,16 +466,19 @@ fn ssprk3_step(
     q2.columns_mut(FIRST, N_CELLS).copy_from(
         &(0.75 * q.columns(FIRST, N_CELLS) + 0.25 * (q1.columns(FIRST, N_CELLS) + dt * &*dq_dt)),
     );
-    apply_bc(q2, left_bc, right_bc);
+    apply_bc(q1, left_bc, right_bc);
 
     // Stage 3: q^{n+1} = 1/3 q^n + 2/3 (q2 + dt * R(q2))
     //copy into q1 first to avoid borrowing q as mutable and immutable simultaneously
     residual(q2, ws, dq_dt);
-    q1.columns_mut(FIRST, N_CELLS).copy_from(&((1.0 / 3.0) * q.columns(FIRST, N_CELLS)
-        + (2.0 / 3.0) * (q2.columns(FIRST, N_CELLS) + dt * &*dq_dt)));
-    q.columns_mut(FIRST, N_CELLS).copy_from(&q1.columns(FIRST, N_CELLS));
+    q1.columns_mut(FIRST, N_CELLS).copy_from(
+        &((1.0 / 3.0) * q.columns(FIRST, N_CELLS)
+            + (2.0 / 3.0) * (q2.columns(FIRST, N_CELLS) + dt * &*dq_dt)),
+    );
+    q.columns_mut(FIRST, N_CELLS)
+        .copy_from(&q1.columns(FIRST, N_CELLS));
 
-    apply_bc(q, left_bc, right_bc);
+    apply_bc(q1, left_bc, right_bc);
 }
 
 ///Converts an ENTIRE (3, W) block of conserved variables into primitives (rho, u, p) --
@@ -539,26 +528,22 @@ fn rho_p_of(qcol: &Matrix3x1<f64>) -> (f64, f64) {
 /// (always conserved, regardless of which path built q_l/q_r), used as the fallback
 /// source. Must run after reconstruction AND after any primitive->conserved
 /// conversion, since it only knows how to read conserved columns.
-fn enforce_positivity(
-    q: &Matrix3xX<f64>,
-    q_l: &mut Matrix3xX<f64>,
-    q_r: &mut Matrix3xX<f64>,
-) -> usize {
-    let mut count = 0;
+fn enforce_positivity(q: &Matrix3xX<f64>, q_l: &mut Matrix3xX<f64>, q_r: &mut Matrix3xX<f64>) {
+    //let mut count = 0;
     for k in 0..N_FACES {
         let (rho_l, p_l) = rho_p_of(&q_l.column(k).into_owned());
         if rho_l <= 0.0 || p_l <= 0.0 {
             q_l.set_column(k, &(q.column(k + 1).into_owned()));
-            count += 1;
+            //count += 1;
         }
 
         let (rho_r, p_r) = rho_p_of(&q_r.column(k).into_owned());
         if rho_r <= 0.0 || p_r <= 0.0 {
             q_r.set_column(k, &(q.column(k + 2).into_owned()));
-            count += 1;
+            //count += 1;
         }
     }
-    count
+    //count
 }
 
 //compute max wave speed for real cells only
@@ -570,24 +555,80 @@ fn max_wave_speed(u: &Matrix1xX<f64>, a: &Matrix1xX<f64>) -> f64 {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let mode = args.get(1).map(|s| s.as_str()).unwrap_or("default");
+    run_pipes();
 
-    match mode {
-        "order-test" => testing::run_order_test(),
-        "gaussian" => testing::run_gaussian_pulse(),
-        "regression" => testing::run_regression_suite(),
-        _ => run_default(),
-    }
 }
 
-fn run_default() {
+fn run_pipes() {
     /*
     unsafe {
         env::set_var("RUST_BACKTRACE", "full");
     }
     */
 
+    let mut pipes: HashMap<usize, Pipe> = HashMap::new();
+    let mut dt;
+    let mut next_dt = f64::INFINITY;
+    let mut t: f64 = 0.0;
+    let mut it: u32 = 0;
+    let mut a: Matrix1xX<f64> = Matrix1xX::zeros(N_TOTAL);
+
+    //initialize all pipes
+    for id in 0..N_PIPES {
+        //for now, do this manually
+        let left_bc = Some(BoundaryCondition::Transmissive);
+        //junction
+        //let right_bc = None;
+        let right_bc = Some(BoundaryCondition::Transmissive);
+
+
+        let (rho0, u0, p0) = match id {
+            0 => testing::density_pulse_test(),
+            _ => testing::at_rest(),
+        };
+
+        //initial total energy
+        let e_tot0 = p0.component_div(&((GAMMA - 1.0) * &rho0)) + 0.5 * u0.component_mul(&u0);
+
+        //initial speed of sound
+        let a: Matrix1xX<f64> = (GAMMA * p0.component_div(&rho0)).map(|x| x.sqrt());
+
+        //prepare next timestep
+        next_dt = next_dt.min(COURANT * DX / max_wave_speed(&u0, &a));
+
+        //construct conservative state vector, now padded with ghost cells (past copy)
+        let mut q0: Matrix3xX<f64> = Matrix3xX::zeros(N_TOTAL);
+        q0.set_row(0, &rho0);
+        q0.set_row(1, &(&rho0.component_mul(&u0)));
+        q0.set_row(2, &(&rho0.component_mul(&e_tot0)));
+        apply_bc(&mut q0, left_bc, right_bc); // initialize ghost cells
+
+        //working copy
+        let q1: Matrix3xX<f64> = q0.to_owned();
+
+        // Cell-center coordinates for the REAL cells only: x_j = (j + 1/2)*dx.
+        let x: Vec<f64> = (0..N_CELLS).map(|j| (j as f64 + 0.5) * DX).collect();
+
+        let workspace = Workspace::new(); // face-width scratch for residual()
+        let dq_dt: Matrix3xX<f64> = Matrix3xX::zeros(N_CELLS); // dq/dt, real cells only
+        let cells = Decoded::zeros(N_TOTAL); // full-domain primitives, for CFL + display
+        let q_stage1: Matrix3xX<f64> = q1.clone();
+        let q_stage2: Matrix3xX<f64> = q1.clone();
+
+        pipes.insert(id,Pipe {
+            workspace,
+            q1,
+            q_stage1,
+            q_stage2,
+            dq_dt,
+            left_bc,
+            right_bc,
+            cells,
+            x
+        });
+    }
+
+    /*
     let left_bc = BoundaryCondition::Periodic;
     let right_bc = BoundaryCondition::Periodic;
 
@@ -624,58 +665,75 @@ fn run_default() {
     let mut cells = Decoded::zeros(N_TOTAL); // full-domain primitives, for CFL + display
     let mut q_stage1: Matrix3xX<f64> = q1.clone();
     let mut q_stage2: Matrix3xX<f64> = q1.clone();
+    */
 
     println!("Beginning Simulation:");
 
     while t < T_END {
-        //full q update occurs within this function
-        ssprk3_step(
-            &mut q1,
-            &mut q_stage1,
-            &mut q_stage2,
-            &mut dq_dt,
-            &mut ws,
-            dt,
-            left_bc,
-            right_bc,
-        );
-
+        dt = next_dt;
+        next_dt = f64::INFINITY;
         t += dt;
         it += 1;
-
-        //decode state variables for operations below
-        decode_state(&q1, &mut cells);
-
-        //Speed of sound, computed in place to avoid allocation
-        a.copy_from(&cells.p);
-        a.component_div_assign(&cells.rho); // a = p/rho
-        a *= GAMMA; // a = gamma*p/rho
-        for x in a.iter_mut() {
-            *x = x.sqrt(); // a = sqrt(gamma*p/rho)
-        }
-
-        dt = COURANT * DX / max_wave_speed(&cells.u, &a);
-        dt = dt.min(T_END - t);
-
-        //NaN check for REAL cells only
-        if cells.rho.columns(FIRST, N_CELLS).iter().any(|&x| x < 0.0)
-            || cells.p.columns(FIRST, N_CELLS).iter().any(|&x| x < 0.0)
-        {
-            panic!("NANANNANANNANAN");
-        }
-
-        //display pressure along the pipe
         println!("Iteration {}", it);
-        let points: Vec<(f32, f32)> = x
-            .iter()
-            .copied()
-            .map(|y| y as f32)
-            .zip(cells.rho.iter().copied().map(|y| y as f32))
-            .collect();
-        Chart::new_with_y_range(100, 100, 0.0, 1.0, 1.0, 2.0)
-            .lineplot(&Shape::Points(points.as_slice()))
-            .display();
-    }
+        for (id,pipe) in pipes.iter_mut() {
+            //full q update occurs within this function
+            ssprk3_step(
+                &mut pipe.q1,
+                &mut pipe.q_stage1,
+                &mut pipe.q_stage2,
+                &mut pipe.dq_dt,
+                &mut pipe.workspace,
+                dt,
+                pipe.left_bc,
+                pipe.right_bc
+            );
 
+            //decode state variables for operations below
+            decode_state(&pipe.q1, &mut pipe.cells);
+
+            //reuse shared "a" buffer to calculate local speed of sound for this pipe
+            a.copy_from(&pipe.cells.p);
+            a.component_div_assign(&pipe.cells.rho); // a = p/rho
+            a *= GAMMA; // a = gamma*p/rho
+            for x in a.iter_mut() {
+                *x = x.sqrt(); // a = sqrt(gamma*p/rho)
+            }
+
+            //update timestep
+            next_dt = next_dt
+                .min(COURANT * DX / max_wave_speed(&pipe.cells.u, &a))
+                .min(T_END - t);
+
+            //NaN check for REAL cells only
+            if pipe
+                .cells
+                .rho
+                .columns(FIRST, N_CELLS)
+                .iter()
+                .any(|&x| x < 0.0)
+                || pipe
+                    .cells
+                    .p
+                    .columns(FIRST, N_CELLS)
+                    .iter()
+                    .any(|&x| x < 0.0)
+            {
+                panic!("NANANNANANNANAN in pipe {}", id);
+            }
+
+            //display pressure along the pipe
+            println!("Pipe {}", id);
+            let points: Vec<(f32, f32)> = pipe
+                .x
+                .iter()
+                .copied()
+                .map(|y| y as f32)
+                .zip(pipe.cells.rho.iter().copied().map(|y| y as f32))
+                .collect();
+            Chart::new_with_y_range(50, 50, 0.0, 1.0, 1.0, 2.0)
+                .lineplot(&Shape::Points(points.as_slice()))
+                .display();
+        }
+    }
     println!("Done");
 }
