@@ -3,18 +3,20 @@
 // https://doi.org/10.1016/S0021-9991(02)00037-2
 
 use nalgebra::{Matrix1xX, Matrix3, Matrix3x1, Matrix3xX};
-use ndarray::linspace;
 use std::{env, ops::AddAssign};
 use textplots::{Chart, Plot, Shape};
 
-//Parameters
+//Input parameters
 const COURANT: f64 = 0.9; //CFL courant number
-const GAMMA: f64 = 1.4; //ratio if specific heats
+const GAMMA: f64 = 1.4; //ratio of specific heats
 const T_END: f64 = 1.0; //how much virtual time to run the simulation
 const N_CELLS: usize = 2048;
+const DOMAIN_LENGTH: f64 = 1.0; //basically how long the pipe is
+
+
+//calculated parameters
 const N_INTERFACES: usize = N_CELLS - 1; //number of interfaces between cells (boundaries don't count)
 const N_INTERIOR: usize = N_CELLS - 2; //number of interior (non boundary) cells
-const DOMAIN_LENGTH: f64 = 1.0; //basically how long the pipe is
 const DX: f64 = DOMAIN_LENGTH / N_CELLS as f64; //step size
 
 ///decodes the state vector into primitives of the conserved variables:
@@ -276,7 +278,7 @@ fn _contact_discontinuity() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) 
     (rho0, u0, p0)
 }
 
-fn supersonic_expansion_test() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
+fn _supersonic_expansion_test() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
     println!("Configuration 1: Sod's problem.");
 
     let mut rho0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
@@ -297,12 +299,32 @@ fn supersonic_expansion_test() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64
     (rho0, u0, p0)
 }
 
+///Custom test to confirm MUSCL + Limiter functionality
+/// Pulse should stay thin and sharp and remain the same shape and size for the entire simulation.
+/// Basic RoeM smears this horizontally, and the conservation of area under the curve causes
+/// height to decrease as well. This is INCORRECT behavior
+pub fn density_pulse_test() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
+    println!("Configuration: density pulse advection test.");
+
+    let mut rho0: Matrix1xX<f64> = Matrix1xX::from_element(N_CELLS, 1.0); // rho_bg
+    let u0: Matrix1xX<f64> = Matrix1xX::from_element(N_CELLS, 0.5);
+    let p0: Matrix1xX<f64> = Matrix1xX::from_element(N_CELLS, 1.0);
+
+    // top-hat: 2% of domain, starting near the inlet
+    let pulse_start = (0.3 * N_CELLS as f64) as usize;
+    let pulse_end = (0.32 * N_CELLS as f64) as usize;
+    rho0.columns_mut(pulse_start, pulse_end - pulse_start)
+        .fill(2.0);
+
+    (rho0, u0, p0)
+}
+
 fn main() {
     unsafe {
         env::set_var("RUST_BACKTRACE", "full");
     }
 
-    let (rho0, u0, p0) = supersonic_expansion_test();
+    let (rho0, u0, p0) = density_pulse_test();
 
     //initial total energy
     let e_tot0 = p0.component_div(&((GAMMA - 1.0) * &rho0)) + 0.5 * u0.component_mul(&u0);
@@ -328,7 +350,8 @@ fn main() {
     let mut t: f64 = 0.0;
     let mut it: u32 = 0;
 
-    let x: Vec<f64> = linspace(DX / 2., 1.0, N_CELLS).into_iter().collect();
+    // Cell Center coordinates
+    let x: Vec<f64> = (0..N_CELLS).map(|j| (j as f64 + 0.5) * DX).collect();
 
     //assigned only once to avoid repeated allocation
     let mut df: Matrix3xX<f64> = Matrix3xX::zeros(N_INTERIOR);
@@ -390,7 +413,7 @@ fn main() {
             .map(|y| y as f32)
             .zip(rho.iter().copied().map(|y| y as f32))
             .collect();
-        Chart::new_with_y_range(100, 100, 0.0, 1.0, 0.0, 1.0)
+        Chart::new_with_y_range(100, 100, 0.0, 1.0, 0.0, 2.0)
             .lineplot(&Shape::Points(points.as_slice()))
             .display();
     }
