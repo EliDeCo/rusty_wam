@@ -1,4 +1,4 @@
-use crate::methods::{muscl_roem1d::MusclRoeM1D, roe1d::Roe1D, roem1d::RoeM1D};
+use crate::pipe_methods::{muscl_roem1d::MusclRoeM1D, roe1d::Roe1D, roem1d::RoeM1D};
 use nalgebra::{Matrix1xX, Matrix3xX};
 use std::ops::AddAssign;
 
@@ -415,6 +415,9 @@ impl InteriorMethod {
     pub fn p(&self) -> &[f64] {
         let s = self.solver().state();
         s.real(&s.p)
+    }
+    pub fn id(&self) -> usize {
+        self.solver().state().id
     }
 }
 

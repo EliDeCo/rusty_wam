@@ -1,8 +1,8 @@
 use nalgebra::{Matrix1xX, Matrix3xX};
-use std::env;
+use std::{collections::BTreeMap, env};
 
 mod helpers;
-mod methods;
+mod pipe_methods;
 mod pipes;
 use helpers::*;
 use pipes::*;
@@ -13,6 +13,7 @@ const GAMMA: f64 = 1.4; //ratio of specific heats
 const T_END: f64 = 1.0; //how much virtual time to run the simulation
 const N_CELLS: usize = 2048;
 const DOMAIN_LENGTH: f64 = 1.0; //basically how long the pipe is
+const N_PIPES: usize = 2; //number of pipes in the simulation
 
 //calculated parameters
 const DX: f64 = DOMAIN_LENGTH / N_CELLS as f64; //step size
@@ -20,7 +21,7 @@ const DX: f64 = DOMAIN_LENGTH / N_CELLS as f64; //step size
 /// Left pressure = 1, right pressure = 0.1.
 /// Left density = 1, right density = 0.125.
 /// Velocity is 0 everywhere
-fn _sods_problem() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
+fn sods_problem() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
     println!("Configuration 1: Sod's problem.");
 
     let mut rho0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
@@ -123,43 +124,62 @@ pub fn density_pulse_test() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) 
     (rho0, u0, p0)
 }
 
+/// At rest
+pub fn _at_rest() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
+    println!("Pipe at rest.");
+
+    let rho0: Matrix1xX<f64> = Matrix1xX::from_element(N_CELLS, 1.0);
+    let u0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
+    let p0: Matrix1xX<f64> = Matrix1xX::from_element(N_CELLS, 1.0);
+
+    (rho0, u0, p0)
+}
+
 fn main() {
     unsafe {
         env::set_var("RUST_BACKTRACE", "full");
     }
 
-    let (rho0, u0, p0) = density_pulse_test();
-
-    //initial total energy
-    let e_tot0 = p0.component_div(&((GAMMA - 1.0) * &rho0)) + 0.5 * u0.component_mul(&u0);
-
-    //construct conservative state vector (past copy)
-    let mut q0: Matrix3xX<f64> = Matrix3xX::zeros(N_CELLS);
-    q0.set_row(0, &rho0);
-    q0.set_row(1, &rho0.component_mul(&u0));
-    q0.set_row(2, &rho0.component_mul(&e_tot0));
-
-    //initialize interior method
-    let mut pipe = InteriorMethod::new(
-        MethodKind::MusclRoeM1D,
-        q0,
-        GAMMA,
-        COURANT,
-        DX,
-        N_CELLS,
-        0,
-        Some(BoundaryCondition::Transmissive),
-        Some(BoundaryCondition::Transmissive),
-    );
+    let mut pipes: BTreeMap<usize, InteriorMethod> = BTreeMap::new();
 
     //other variables
-    let mut dt = pipe.get_timestep();
+    let mut dt;
     let mut t = 0.0;
     let mut it = 0;
 
+    for id in 0..N_PIPES {
+        let (rho0, u0, p0) = match id {
+            0 => density_pulse_test(),
+            _ => sods_problem(),
+        };
+
+        //initial total energy
+        let e_tot0 = p0.component_div(&((GAMMA - 1.0) * &rho0)) + 0.5 * u0.component_mul(&u0);
+
+        //construct conservative state vector (past copy)
+        let mut q0: Matrix3xX<f64> = Matrix3xX::zeros(N_CELLS);
+        q0.set_row(0, &rho0);
+        q0.set_row(1, &rho0.component_mul(&u0));
+        q0.set_row(2, &rho0.component_mul(&e_tot0));
+
+        let pipe = InteriorMethod::new(
+            MethodKind::RoeM1D,
+            q0,
+            GAMMA,
+            COURANT,
+            DX,
+            N_CELLS,
+            id,
+            Some(BoundaryCondition::Transmissive),
+            Some(BoundaryCondition::Transmissive),
+        );
+
+        pipes.insert(id, pipe);
+    }
+
     let chart = ChartDetails {
-        width: 100,
-        height: 100,
+        width: 50,
+        height: 50,
         x_min: 0.0,
         x_max: 1.0,
         y_min: 0.0,
@@ -170,22 +190,26 @@ fn main() {
     println!("Beginning Simulation:");
 
     while t < T_END {
-        //update cell states
-        pipe.update(dt);
+        dt = pipes
+            .values_mut()
+            .fold(f64::INFINITY, |dt, pipe| dt.min(pipe.get_timestep()))
+            .min(T_END - t);
+
+        for pipe in pipes.values_mut() {
+            //check Nan
+            pipe.nan_check();
+
+            //temp display
+            if it % 200 == 0 {
+                plot(pipe.rho(), it, pipe.id(), &chart);
+            }
+
+            //update cell states
+            pipe.update(dt);
+        }
 
         t += dt;
         it += 1;
-
-        //update timestep
-        dt = pipe.get_timestep().min(T_END - t);
-
-        //check Nan
-        pipe.nan_check();
-
-        //temp display
-        if it % 100 == 0 {
-            plot(pipe.rho(), it, 0, &chart);
-        }
     }
     println!("Done");
 }
