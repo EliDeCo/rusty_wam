@@ -1,11 +1,8 @@
-// This paper impliments a 1D version of the RoeM2 scheme from the following paper,
-// witht the exceptions of the f and g functions which only give benefits in higher dimensions
-// https://doi.org/10.1016/S0021-9991(02)00037-2
-
 use nalgebra::{Matrix1xX, Matrix3xX};
 use std::env;
 
 mod helpers;
+mod methods;
 mod pipes;
 use helpers::*;
 use pipes::*;
@@ -13,7 +10,7 @@ use pipes::*;
 //Input parameters
 const COURANT: f64 = 0.9; //CFL courant number
 const GAMMA: f64 = 1.4; //ratio of specific heats
-const T_END: f64 = 5.0; //how much virtual time to run the simulation
+const T_END: f64 = 1.0; //how much virtual time to run the simulation
 const N_CELLS: usize = 2048;
 const DOMAIN_LENGTH: f64 = 1.0; //basically how long the pipe is
 
@@ -139,11 +136,11 @@ fn main() {
     //construct conservative state vector (past copy)
     let mut q0: Matrix3xX<f64> = Matrix3xX::zeros(N_CELLS);
     q0.set_row(0, &rho0);
-    q0.set_row(1, &(&rho0.component_mul(&u0)));
-    q0.set_row(2, &(&rho0.component_mul(&e_tot0)));
+    q0.set_row(1, &rho0.component_mul(&u0));
+    q0.set_row(2, &rho0.component_mul(&e_tot0));
 
     //initialize interior method
-    let mut pipe = InteriorMethod::new("RoeM1D", q0, GAMMA, COURANT, DX, N_CELLS, 0);
+    let mut pipe = InteriorMethod::new(MethodKind::RoeM1D, q0, GAMMA, COURANT, DX, N_CELLS, 0);
 
     //other variables
     let mut dt = pipe.get_timestep();
