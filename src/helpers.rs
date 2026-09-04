@@ -1,4 +1,3 @@
-use nalgebra::Matrix1xX;
 use textplots::{Chart, Plot, Shape};
 
 pub struct ChartDetails {
@@ -11,7 +10,7 @@ pub struct ChartDetails {
     pub x: Vec<f64>,
 }
 
-pub fn plot(y: &Matrix1xX<f64>, iteration: u32, pipe_id: usize, chart: &ChartDetails) {
+pub fn plot(y: &[f64], iteration: u32, pipe_id: usize, chart: &ChartDetails) {
     println!("Pipe #{}, Iteration {}", pipe_id, iteration);
     let points: Vec<(f32, f32)> = chart
         .x

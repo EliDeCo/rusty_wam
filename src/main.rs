@@ -140,7 +140,17 @@ fn main() {
     q0.set_row(2, &rho0.component_mul(&e_tot0));
 
     //initialize interior method
-    let mut pipe = InteriorMethod::new(MethodKind::RoeM1D, q0, GAMMA, COURANT, DX, N_CELLS, 0);
+    let mut pipe = InteriorMethod::new(
+        MethodKind::MusclRoeM1D,
+        q0,
+        GAMMA,
+        COURANT,
+        DX,
+        N_CELLS,
+        0,
+        Some(BoundaryCondition::Transmissive),
+        Some(BoundaryCondition::Transmissive),
+    );
 
     //other variables
     let mut dt = pipe.get_timestep();
