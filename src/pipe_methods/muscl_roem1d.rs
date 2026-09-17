@@ -6,7 +6,7 @@
 // The flux is the same RoeM2 scheme used by RoeM1D, applied to the reconstructed
 // left/right face states instead of to neighbouring cell averages.
 
-use crate::pipes::{InteriorSolver, PipeState, apply_bc};
+use crate::pipes::{InteriorSolver, PipeState};
 use nalgebra::{Matrix1xX, Matrix3, Matrix3x1, Matrix3xX};
 use std::ops::AddAssign;
 
@@ -458,53 +458,16 @@ fn residual(
         .sub_to(&ws.phi.columns(0, n_real), df);
 }
 
-///One SSP-RK3 stage, in place: dst[real] = a*q_n[real] + b*(src[real] + dt*R),
-/// where R = -df/dx. Doing the blend in place keeps the time loop allocation free,
-/// which the reference's expression-form stages did not.
-#[allow(clippy::too_many_arguments)]
-fn rk_stage(
-    dst: &mut Matrix3xX<f64>,
-    q_n: &Matrix3xX<f64>,
-    src: &Matrix3xX<f64>,
-    df: &Matrix3xX<f64>,
-    a: f64,
-    b: f64,
-    dt_over_dx: f64,
-    first: usize,
-    n_real: usize,
-) {
-    let mut d = dst.columns_mut(first, n_real);
-
-    // d = src + dt*R
-    d.copy_from(&src.columns(first, n_real));
-    d.zip_apply(df, |x, dfv| *x -= dt_over_dx * dfv);
-
-    // d = a*q_n + b*d   (stage 1 is a=0, b=1, so skip the blend entirely)
-    if a != 0.0 {
-        d *= b;
-        d.zip_apply(&q_n.columns(first, n_real), |x, qn| *x += a * qn);
-    }
-}
-
-///Third order MUSCL reconstruction with SSP-RK3 time integration around the RoeM2 flux.
+///Third order MUSCL reconstruction around the RoeM2 flux.
 pub struct MusclRoeM1D {
     shared: PipeState,
     ws: Workspace,
-    q_stage1: Matrix3xX<f64>, // n_total
-    q_stage2: Matrix3xX<f64>, // n_total
 }
 
 impl MusclRoeM1D {
     pub(crate) fn new(state: PipeState) -> Self {
         let ws = Workspace::new(state.n_total, state.n_faces);
-        let q_stage1 = state.q1.clone();
-        let q_stage2 = state.q1.clone();
-        Self {
-            shared: state,
-            ws,
-            q_stage1,
-            q_stage2,
-        }
+        Self { shared: state, ws }
     }
 }
 
@@ -516,72 +479,12 @@ impl InteriorSolver for MusclRoeM1D {
         &mut self.shared
     }
 
-    ///One residual evaluation from the current state, in the shared df convention.
-    /// The RK3 `update` below drives its own stages instead of going through here,
-    /// but keeping the convention means the default forward-euler update would still
-    /// be correct.
-    fn flux_divergence(&mut self) {
+    ///One residual evaluation for the state q, in the shared df convention.
+    /// Decodes its own face states, so it never touches the shared primitives.
+    fn residual(&mut self, q: &Matrix3xX<f64>) {
         let (first, n_real, gamma) = (self.shared.first, self.shared.n_real, self.shared.gamma);
         let Self { shared, ws, .. } = self;
-        residual(&shared.q1, ws, &mut shared.df, first, n_real, gamma);
+        residual(q, ws, &mut shared.df, first, n_real, gamma);
     }
 
-    ///Advances the interior state by one full SSP-RK3 step of size dt.
-    ///
-    /// This method decodes its own face states inside `residual` and never reads the
-    /// shared primitives, so the "re-decode between stages" rule on the trait does
-    /// not apply here. `save_step` is skipped too - nothing reads q0, since `advance`
-    /// is unused.
-    fn update(&mut self, dt: f64) {
-        let (first, n_real, n_ghost, gamma, dx) = (
-            self.shared.first,
-            self.shared.n_real,
-            self.shared.n_ghost,
-            self.shared.gamma,
-            self.shared.dx,
-        );
-        let (left_bc, right_bc) = (self.shared.left_bc, self.shared.right_bc);
-        let c = dt / dx;
-
-        let Self {
-            shared,
-            ws,
-            q_stage1,
-            q_stage2,
-        } = self;
-
-        // Stage 1: s1 = q^n + dt*R(q^n)   -- an ordinary forward-Euler step
-        residual(&shared.q1, ws, &mut shared.df, first, n_real, gamma);
-        rk_stage(
-            q_stage1, &shared.q1, &shared.q1, &shared.df, 0.0, 1.0, c, first, n_real,
-        );
-        apply_bc(q_stage1, first, n_real, n_ghost, left_bc, right_bc);
-
-        // Stage 2: s2 = 3/4 q^n + 1/4 (s1 + dt*R(s1))
-        residual(q_stage1, ws, &mut shared.df, first, n_real, gamma);
-        rk_stage(
-            q_stage2, &shared.q1, q_stage1, &shared.df, 0.75, 0.25, c, first, n_real,
-        );
-        apply_bc(q_stage2, first, n_real, n_ghost, left_bc, right_bc);
-
-        // Stage 3: q^{n+1} = 1/3 q^n + 2/3 (s2 + dt*R(s2))
-        //staged through q_stage1 first, since q1 is both source and destination here
-        residual(q_stage2, ws, &mut shared.df, first, n_real, gamma);
-        rk_stage(
-            q_stage1,
-            &shared.q1,
-            q_stage2,
-            &shared.df,
-            1.0 / 3.0,
-            2.0 / 3.0,
-            c,
-            first,
-            n_real,
-        );
-        shared
-            .q1
-            .columns_mut(first, n_real)
-            .copy_from(&q_stage1.columns(first, n_real));
-        apply_bc(&mut shared.q1, first, n_real, n_ghost, left_bc, right_bc);
-    }
 }

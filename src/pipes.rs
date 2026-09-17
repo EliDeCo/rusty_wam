@@ -1,3 +1,4 @@
+use crate::helpers::unphysical;
 use crate::pipe_methods::{muscl_roem1d::MusclRoeM1D, roe1d::Roe1D, roem1d::RoeM1D};
 use nalgebra::{Matrix1xX, Matrix3xX};
 use std::ops::AddAssign;
@@ -7,16 +8,12 @@ use std::ops::AddAssign;
 pub enum BoundaryCondition {
     ///zero-gradient: waves pass through the end undisturbed
     Transmissive,
+    ///Connected to a junction with the given id
+    Junction(usize),
 }
 
-///Fills the ghost cells surrounding the real domain so every real cell - including the
-/// ones nearest each edge - can be updated with the exact same stencil.
-/// left/right are independent so e.g. a closed-end shock tube (wall + transmissive)
-/// can be built from the same function. `None` leaves that end's ghosts untouched,
-/// which reproduces a fixed (frozen) boundary.
-///
-/// Free function rather than a method because SSP-RK3 has to apply it to its stage
-/// buffers, which a `&mut self` method could not reach without a borrow conflict.
+///Refills the ghost cells on each end so every real cell uses the same stencil.
+/// `None` leaves that end untouched, which reproduces a fixed boundary.
 pub(crate) fn apply_bc(
     q: &mut Matrix3xX<f64>,
     first: usize,
@@ -32,6 +29,8 @@ pub(crate) fn apply_bc(
         for g in 0..n_ghost {
             q.set_column(g, &mirror);
         }
+    } else if let Some(BoundaryCondition::Junction(id)) = left {
+        //TODO: Impliment
     }
 
     if let Some(BoundaryCondition::Transmissive) = right {
@@ -39,29 +38,30 @@ pub(crate) fn apply_bc(
         for g in 0..n_ghost {
             q.set_column(n_total - 1 - g, &mirror);
         }
+    } else if let Some(BoundaryCondition::Junction(id)) = right {
+        //TODO: Impliment
     }
 }
 
-///Buffers and parameters shared by every interior method.
-/// Every buffer is allocated once here and written in place afterwards, so the
-/// simulation loop performs no heap allocation.
-///
-/// The grid is padded: `n_ghost` ghost cells sit on each end of the `n_real` real
-/// cells, so the real cells occupy `first .. first + n_real` in every n_total-wide
-/// buffer. How many ghosts a method needs depends on its stencil width, so `n_ghost`
-/// comes from `MethodKind::n_ghost`.
+///Buffers and parameters shared by every interior method, allocated once each.
+/// The grid is padded, so the real cells occupy `first .. first + n_real`.
 pub struct PipeState {
     //conservative state, 3 values per cell
-    pub(crate) q0: Matrix3xX<f64>, //n_total, frozen base for the current step
     pub(crate) q1: Matrix3xX<f64>, //n_total, working (current) state
 
     //decoded primitives of q1, one value per cell (ghosts included).
     //`decode` refreshes these; `advance` invalidates them by moving q1 underneath.
+    ///kg/m3
     pub(crate) rho: Matrix1xX<f64>,
+    ///m/s
     pub(crate) u: Matrix1xX<f64>,
+    ///J/kg
     pub(crate) e: Matrix1xX<f64>,
+    ///Pa
     pub(crate) p: Matrix1xX<f64>,
+    ///J/kg
     pub(crate) h: Matrix1xX<f64>,
+    ///m/s
     pub(crate) a: Matrix1xX<f64>, //speed of sound, only needed for the CFL condition
 
     //flux workspace
@@ -80,6 +80,8 @@ pub struct PipeState {
     pub(crate) gamma: f64,
     pub(crate) courant: f64,
     pub(crate) dx: f64,
+    ///radius of the pipe in meters
+    pub(crate) r: f64,
     pub(crate) id: usize,
     pub(crate) left_bc: Option<BoundaryCondition>,
     pub(crate) right_bc: Option<BoundaryCondition>,
@@ -95,12 +97,13 @@ impl PipeState {
         gamma: f64,
         courant: f64,
         dx: f64,
-        n_real: usize,
         id: usize,
+        radius: f64,
         left_bc: Option<BoundaryCondition>,
         right_bc: Option<BoundaryCondition>,
     ) -> Self {
         let first = n_ghost;
+        let n_real = state.ncols();
         let n_total = n_real + 2 * n_ghost;
         let n_faces = n_real + 1;
 
@@ -121,7 +124,6 @@ impl PipeState {
             e: placeholder.clone(),
             p: placeholder.clone(),
             h: placeholder,
-            q0: q1.clone(),
             q1,
             n_real,
             n_ghost,
@@ -130,6 +132,7 @@ impl PipeState {
             n_faces,
             courant,
             dx,
+            r: radius,
             id,
             gamma,
             left_bc,
@@ -137,11 +140,7 @@ impl PipeState {
         }
     }
 
-    ///decodes the current state vector (q1) into primitives of the conserved variables:
-    /// rho (density), u (velocity), e (specific total energy), p (pressure),
-    /// h (specific total enthalpy).
-    /// They are vectors with one value per finite-volume cell, ghosts included -
-    /// the face loops need primitives in the ghosts too.
+    ///Decodes the pipe's own current state into the shared primitive buffers.
     pub(crate) fn decode(&mut self) {
         let Self {
             q1,
@@ -153,30 +152,21 @@ impl PipeState {
             gamma,
             ..
         } = self;
-        let gamma = *gamma;
+        decode_into(q1, rho, u, e, p, h, *gamma);
+    }
 
-        rho.copy_from(&q1.row(0));
-
-        u.copy_from(&q1.row(1)); //velocity
-        u.component_div_assign(rho); // u = (rho*u)/rho, in place
-
-        e.copy_from(&q1.row(2)); // specific total energy, NOT specific internal energy
-        e.component_div_assign(rho); // e = (rho*E)/rho, in place
-
-        // pressure from equation of state
-        //done step by step to avoid allocation
-        p.copy_from(u);
-        p.component_mul_assign(u); // p = u*u
-        *p *= -0.5; // p = -0.5*u*u
-        p.add_assign(&*e); // p = e - 0.5*u*u
-        p.component_mul_assign(rho); // p = rho*(e - 0.5*u*u)
-        *p *= gamma - 1.0; // p = (γ-1)*rho*(e - 0.5*u*u)
-
-        // specific total enthalpy
-        // computed in steps to avoid extra allocation
-        h.copy_from(p);
-        h.component_div_assign(rho); // h = p/rho
-        h.add_assign(&*e); // h = e + p/rho
+    ///Decodes an externally held state into the shared primitive buffers.
+    pub(crate) fn decode_from(&mut self, q: &Matrix3xX<f64>) {
+        let Self {
+            rho,
+            u,
+            e,
+            p,
+            h,
+            gamma,
+            ..
+        } = self;
+        decode_into(q, rho, u, e, p, h, *gamma);
     }
 
     ///Calculates the Euler flux (F) for every cell from the decoded primitives.
@@ -205,7 +195,7 @@ impl PipeState {
         }
     }
 
-    ///Returns the dt for this pipe.
+    ///Returns the minimum dt for this pipe.
     pub fn get_timestep(&mut self) -> f64 {
         self.decode();
 
@@ -233,54 +223,34 @@ impl PipeState {
         *courant * *dx / max_wave_speed(u, a, *first, *n_real)
     }
 
-    ///Checks for negative density or pressure in the real cells, which indicate a
-    /// numerical blowup.
-    pub fn nan_check(&self) {
+    ///Checks for a density or pressure in the real cells that is not physically
+    /// usable, which indicates a numerical blowup.
+    pub fn unreal_check(&self) {
         let real = self.first..self.first + self.n_real;
-        if self.rho.as_slice()[real.clone()].iter().any(|&x| x < 0.0)
-            || self.p.as_slice()[real].iter().any(|&x| x < 0.0)
+        if self.rho.as_slice()[real.clone()]
+            .iter()
+            .copied()
+            .any(unphysical)
+            || self.p.as_slice()[real].iter().copied().any(unphysical)
         {
-            panic!("Nan in pipe: {}", self.id);
+            panic!("Unphysical state in pipe {}", self.id);
         }
-    }
-
-    ///Moves current solution to previous solution buffer
-    pub(crate) fn save_step(&mut self) {
-        self.q0.copy_from(&self.q1);
-    }
-
-    ///Finite volume update: q1 = q0 - (dt/dx)*df over the real cells, then refills
-    /// the ghosts from the boundary conditions.
-    /// Leaves the decoded primitives stale, since q1 has moved.
-    pub(crate) fn advance(&mut self, dt: f64) {
-        let Self {
-            df,
-            q0,
-            q1,
-            first,
-            n_real,
-            dx,
-            ..
-        } = self;
-
-        *df *= -(dt / *dx);
-        q0.columns(*first, *n_real)
-            .add_to(&*df, &mut q1.columns_mut(*first, *n_real));
-
-        apply_bc(
-            &mut self.q1,
-            self.first,
-            self.n_real,
-            self.n_ghost,
-            self.left_bc,
-            self.right_bc,
-        );
     }
 
     ///The real-cell window of a full-width per-cell buffer.
     /// Matrix1xX is a single contiguous row, so this is a plain slice.
     pub(crate) fn real<'a>(&self, m: &'a Matrix1xX<f64>) -> &'a [f64] {
         &m.as_slice()[self.first..self.first + self.n_real]
+    }
+
+    ///Returns the volume of a single cell in this pipe
+    pub fn cell_volume(&self) -> f64 {
+        self.pipe_area() * self.dx
+    }
+
+    ///Returns the surface area of the pipe cross-sections
+    pub fn pipe_area(&self) -> f64 {
+        self.r * self.r * std::f64::consts::PI
     }
 }
 
@@ -291,25 +261,9 @@ pub trait InteriorSolver {
     fn state(&self) -> &PipeState;
     fn state_mut(&mut self) -> &mut PipeState;
 
-    ///Fills state.df with the raw flux difference phi[k+1] - phi[k] over the real
-    /// cells. `advance` supplies the -(dt/dx) scaling, so every method writes df in
-    /// the same convention.
-    /// This is mainly the only part that differs between interior methods.
-    ///
-    /// Assumes the decoded primitives are already current for q1, so implementors
-    /// do not decode by default. An override calling this more than once per step
-    /// (like RK3) MUST `state_mut().decode()` after each `advance` - unless, like
-    /// MusclRoeM1D, it decodes its own face states and never reads the shared ones.
-    fn flux_divergence(&mut self);
-
-    ///Advances the interior state forward in time by dt.
-    /// Override this only when the *time* integration differs from a
-    /// single forward euler stage
-    fn update(&mut self, dt: f64) {
-        self.state_mut().save_step();
-        self.flux_divergence();
-        self.state_mut().advance(dt);
-    }
+    ///Fills state.df with the raw flux difference phi[k+1] - phi[k] for the state q.
+    /// The driver supplies the -(dt/dx) scaling, so every method writes df alike.
+    fn residual(&mut self, q: &Matrix3xX<f64>);
 }
 
 ///Selects which interior method InteriorMethod::new constructs
@@ -333,6 +287,61 @@ impl MethodKind {
     }
 }
 
+///Which explicit SSP Runge-Kutta scheme the driver advances everything with.
+/// Every variant has SSP coefficient 1, so one CFL number covers all of them.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] //variants are selected by editing main.rs
+pub enum TimeIntegrator {
+    Euler,
+    Ssp2,
+    Ssp3,
+}
+
+impl TimeIntegrator {
+    ///Blend weights (a, b) for each stage in turn, where a + b is always 1.
+    pub(crate) fn stages(&self) -> &'static [(f64, f64)] {
+        match self {
+            TimeIntegrator::Euler => &[(0.0, 1.0)],
+            TimeIntegrator::Ssp2 => &[(0.0, 1.0), (0.5, 0.5)],
+            TimeIntegrator::Ssp3 => &[(0.0, 1.0), (0.75, 0.25), (1.0 / 3.0, 2.0 / 3.0)],
+        }
+    }
+
+    ///Scratch registers the driver holds per pipe, on top of the q^n register.
+    pub(crate) fn n_registers(&self) -> usize {
+        self.stages().len() - 1
+    }
+}
+
+///One integrator stage in place: dst = a*q_n + b*(src + dt*R), where R = -df/dx.
+/// Doing the blend in place keeps the time loop allocation free.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rk_stage(
+    dst: &mut Matrix3xX<f64>,
+    q_n: &Matrix3xX<f64>,
+    src: &Matrix3xX<f64>,
+    df: &Matrix3xX<f64>,
+    a: f64,
+    b: f64,
+    dt_over_dx: f64,
+    first: usize,
+    n_real: usize,
+) {
+    debug_assert!((a + b - 1.0).abs() < 1e-15, "stage weights must sum to 1");
+
+    let mut d = dst.columns_mut(first, n_real);
+
+    // d = src + dt*R
+    d.copy_from(&src.columns(first, n_real));
+    d.zip_apply(df, |x, dfv| *x -= dt_over_dx * dfv);
+
+    // d = a*q_n + b*d   (stage 1 is a=0, b=1, so skip the blend entirely)
+    if a != 0.0 {
+        d *= b;
+        d.zip_apply(&q_n.columns(first, n_real), |x, qn| *x += a * qn);
+    }
+}
+
 ///Owns one interior method and dispatches to it
 #[allow(clippy::large_enum_variant)]
 pub enum InteriorMethod {
@@ -343,6 +352,12 @@ pub enum InteriorMethod {
 
 impl InteriorMethod {
     ///Returns a new InteriorMethod instance from the conservative state vector
+    /// # Units
+    /// * `state[0]` - mass density in kg/m^3
+    /// * `state[1]` - momentum desnity in kg/(m^2-s)
+    /// * `state[2]` - energy density in J/m^3
+    /// * `radius` - pipe radius in mm
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         kind: MethodKind,
@@ -350,8 +365,8 @@ impl InteriorMethod {
         gamma: f64,
         courant: f64,
         dx: f64,
-        n_real: usize,
         id: usize,
+        radius: f64,
         left_bc: Option<BoundaryCondition>,
         right_bc: Option<BoundaryCondition>,
     ) -> Self {
@@ -361,8 +376,8 @@ impl InteriorMethod {
             gamma,
             courant,
             dx,
-            n_real,
             id,
+            radius * 0.001, //mm to m
             left_bc,
             right_bc,
         );
@@ -375,32 +390,27 @@ impl InteriorMethod {
     }
 
     //The only per-variant match arms exist here
-    fn solver(&self) -> &dyn InteriorSolver {
+    pub fn solver(&self) -> &dyn InteriorSolver {
         match self {
             Self::RoeM1D(s) => s,
             Self::Roe1D(s) => s,
             Self::MusclRoeM1D(s) => s,
         }
     }
-    fn solver_mut(&mut self) -> &mut dyn InteriorSolver {
+    pub(crate) fn solver_mut(&mut self) -> &mut dyn InteriorSolver {
         match self {
             Self::RoeM1D(s) => s,
             Self::Roe1D(s) => s,
             Self::MusclRoeM1D(s) => s,
         }
-    }
-
-    ///Updates the interior state forward in time
-    pub fn update(&mut self, dt: f64) {
-        self.solver_mut().update(dt);
     }
 
     ///Returns the dt for this pipe
     pub fn get_timestep(&mut self) -> f64 {
         self.solver_mut().state_mut().get_timestep()
     }
-    pub fn nan_check(&self) {
-        self.solver().state().nan_check();
+    pub fn unreal_check(&self) {
+        self.solver().state().unreal_check();
     }
     pub fn rho(&self) -> &[f64] {
         let s = self.solver().state();
@@ -419,6 +429,7 @@ impl InteriorMethod {
     pub fn id(&self) -> usize {
         self.solver().state().id
     }
+
 }
 
 ///Largest signal speed over the real cells only.
@@ -428,4 +439,40 @@ fn max_wave_speed(u: &Matrix1xX<f64>, a: &Matrix1xX<f64>, first: usize, n_real: 
         .iter()
         .zip(a.as_slice()[real].iter())
         .fold(0.0_f64, |speed, (&ui, &ai)| speed.max(ui.abs() + ai))
+}
+
+
+///Decodes a conservative state into density, velocity, energy, pressure and enthalpy.
+/// One value per cell, ghosts included, since the face loops read primitives there too.
+#[allow(clippy::too_many_arguments)]
+fn decode_into(
+    q: &Matrix3xX<f64>,
+    rho: &mut Matrix1xX<f64>,
+    u: &mut Matrix1xX<f64>,
+    e: &mut Matrix1xX<f64>,
+    p: &mut Matrix1xX<f64>,
+    h: &mut Matrix1xX<f64>,
+    gamma: f64,
+) {
+    rho.copy_from(&q.row(0));
+    u.copy_from(&q.row(1)); //velocity
+    u.component_div_assign(rho); // u = (rho*u)/rho, in place
+
+    e.copy_from(&q.row(2)); // specific total energy, NOT specific internal energy
+    e.component_div_assign(rho); // e = (rho*E)/rho, in place
+
+    // pressure from equation of state
+    //done step by step to avoid allocation
+    p.copy_from(u);
+    p.component_mul_assign(u); // p = u*u
+    *p *= -0.5; // p = -0.5*u*u
+    p.add_assign(&*e); // p = e - 0.5*u*u
+    p.component_mul_assign(rho); // p = rho*(e - 0.5*u*u)
+    *p *= gamma - 1.0; // p = (γ-1)*rho*(e - 0.5*u*u)
+
+    // specific total enthalpy
+    // computed in steps to avoid extra allocation
+    h.copy_from(p);
+    h.component_div_assign(rho); // h = p/rho
+    h.add_assign(&*e); // h = e + p/rho
 }

@@ -2,7 +2,7 @@
 //https://github.com/psvolpiani/YouTube-CFD-101
 
 use crate::pipes::{InteriorSolver, PipeState};
-use nalgebra::{Matrix3, Matrix3x1};
+use nalgebra::{Matrix3, Matrix3x1, Matrix3xX};
 
 pub struct Roe1D(PipeState);
 
@@ -21,7 +21,8 @@ impl InteriorSolver for Roe1D {
     }
 
     ///Calculates the Roe1D flux at every interface, then differences it into df.
-    fn flux_divergence(&mut self) {
+    fn residual(&mut self, q: &Matrix3xX<f64>) {
+        self.0.decode_from(q);
         self.0.euler_flux();
 
         //copy the scalars out first so the buffers below can be split-borrowed
@@ -29,7 +30,6 @@ impl InteriorSolver for Roe1D {
         let first = self.0.first;
         let n_real = self.0.n_real;
         let PipeState {
-            q0,
             phi,
             f,
             df,
@@ -60,9 +60,9 @@ impl InteriorSolver for Roe1D {
 
             //difference between neighboring cell states
             let dq: Matrix3x1<f64> = Matrix3x1::new(
-                q0[(0, ir)] - q0[(0, il)], // d(rho)
-                q0[(1, ir)] - q0[(1, il)], // d(rho*u)
-                q0[(2, ir)] - q0[(2, il)], // d(rho*E)
+                q[(0, ir)] - q[(0, il)], // d(rho)
+                q[(1, ir)] - q[(1, il)], // d(rho*u)
+                q[(2, ir)] - q[(2, il)], // d(rho*E)
             );
 
             //Eigenvector matrix P

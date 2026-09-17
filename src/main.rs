@@ -1,19 +1,28 @@
 use nalgebra::{Matrix1xX, Matrix3xX};
 use std::{collections::BTreeMap, env};
 
+mod driver;
 mod helpers;
+mod junctions;
 mod pipe_methods;
 mod pipes;
+mod regression;
+use driver::Driver;
 use helpers::*;
+use junctions::*;
 use pipes::*;
 
 //Input parameters
 const COURANT: f64 = 0.9; //CFL courant number
 const GAMMA: f64 = 1.4; //ratio of specific heats
 const T_END: f64 = 1.0; //how much virtual time to run the simulation
-const N_CELLS: usize = 2048;
-const DOMAIN_LENGTH: f64 = 1.0; //basically how long the pipe is
+const N_CELLS: usize = 2048; //how many real cells there are
+const DOMAIN_LENGTH: f64 = 1.0; //basically how long the pipe is in meters
 const N_PIPES: usize = 2; //number of pipes in the simulation
+const PIPE_RADIUS: f64 = 30.0; //Pipe radius in mm
+const METHOD: MethodKind = MethodKind::RoeM1D; //interior method every pipe uses
+const RK_ORDER: TimeIntegrator = TimeIntegrator::Euler; //explicit SSP scheme, any method
+const DUMP_DIR: Option<&str> = None; //Some(path) turns on bit-exact regression dumps
 
 //calculated parameters
 const DX: f64 = DOMAIN_LENGTH / N_CELLS as f64; //step size
@@ -21,7 +30,7 @@ const DX: f64 = DOMAIN_LENGTH / N_CELLS as f64; //step size
 /// Left pressure = 1, right pressure = 0.1.
 /// Left density = 1, right density = 0.125.
 /// Velocity is 0 everywhere
-fn sods_problem() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
+fn _sods_problem() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
     println!("Configuration 1: Sod's problem.");
 
     let mut rho0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
@@ -125,7 +134,7 @@ pub fn density_pulse_test() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) 
 }
 
 /// At rest
-pub fn _at_rest() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
+pub fn at_rest() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
     println!("Pipe at rest.");
 
     let rho0: Matrix1xX<f64> = Matrix1xX::from_element(N_CELLS, 1.0);
@@ -141,6 +150,7 @@ fn main() {
     }
 
     let mut pipes: BTreeMap<usize, InteriorMethod> = BTreeMap::new();
+    let mut junctions: BTreeMap<usize, Junction> = BTreeMap::new();
 
     //other variables
     let mut dt;
@@ -150,7 +160,7 @@ fn main() {
     for id in 0..N_PIPES {
         let (rho0, u0, p0) = match id {
             0 => density_pulse_test(),
-            _ => sods_problem(),
+            _ => at_rest(),
         };
 
         //initial total energy
@@ -163,19 +173,34 @@ fn main() {
         q0.set_row(2, &rho0.component_mul(&e_tot0));
 
         let pipe = InteriorMethod::new(
-            MethodKind::RoeM1D,
+            METHOD,
             q0,
             GAMMA,
             COURANT,
             DX,
-            N_CELLS,
             id,
+            PIPE_RADIUS,
             Some(BoundaryCondition::Transmissive),
             Some(BoundaryCondition::Transmissive),
         );
 
         pipes.insert(id, pipe);
     }
+
+    //initialize the only junction for testing
+    //ideally the density pulse should travel through the junciton and continue into pipe 1
+    let mut j = Junction::new(GAMMA, COURANT, N_PIPES);
+    //spread all pipes evenly for now
+    let directions = spread_directions(N_PIPES);
+    for (pipe, dir) in pipes.values().zip(directions) {
+        let left = match pipe.id() {
+            0 => false, //pipe 0 outputs into the junction
+            _ => true,  //all others recieve from the junction
+        };
+        j.add_pipe(pipe.id(), left, dir, pipe.solver().state().pipe_area());
+    }
+
+    junctions.insert(N_PIPES, j);
 
     let chart = ChartDetails {
         width: 50,
@@ -187,7 +212,13 @@ fn main() {
         x: (0..N_CELLS).map(|j| (j as f64 + 0.5) * DX).collect(),
     };
 
+    let mut driver = Driver::new(RK_ORDER, &pipes);
+
     println!("Beginning Simulation:");
+
+    if let Some(dir) = DUMP_DIR {
+        regression::init(dir);
+    }
 
     while t < T_END {
         dt = pipes
@@ -195,21 +226,33 @@ fn main() {
             .fold(f64::INFINITY, |dt, pipe| dt.min(pipe.get_timestep()))
             .min(T_END - t);
 
-        for pipe in pipes.values_mut() {
+        if let Some(dir) = DUMP_DIR {
+            regression::trace_step(dir, it, t, dt);
+            if regression::is_checkpoint(it) {
+                regression::dump_state(dir, it, &pipes);
+            }
+        }
+
+        for pipe in pipes.values() {
             //check Nan
-            pipe.nan_check();
+            pipe.unreal_check();
 
             //temp display
             if it % 200 == 0 {
                 plot(pipe.rho(), it, pipe.id(), &chart);
             }
-
-            //update cell states
-            pipe.update(dt);
         }
+
+        //update cell states
+        driver.step(dt, &mut pipes);
 
         t += dt;
         it += 1;
     }
+
+    if let Some(dir) = DUMP_DIR {
+        regression::dump_state(dir, it, &pipes);
+    }
+
     println!("Done");
 }

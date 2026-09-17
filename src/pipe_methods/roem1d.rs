@@ -3,7 +3,7 @@
 // https://doi.org/10.1016/S0021-9991(02)00037-2
 
 use crate::pipes::{InteriorSolver, PipeState};
-use nalgebra::{Matrix3, Matrix3x1};
+use nalgebra::{Matrix3, Matrix3x1, Matrix3xX};
 
 pub struct RoeM1D(PipeState);
 
@@ -22,7 +22,8 @@ impl InteriorSolver for RoeM1D {
     }
 
     ///Calculates the RoeM flux at every interface, then differences it into df.
-    fn flux_divergence(&mut self) {
+    fn residual(&mut self, q: &Matrix3xX<f64>) {
+        self.0.decode_from(q);
         self.0.euler_flux();
 
         //copy the scalars out first so the buffers below can be split-borrowed
@@ -30,7 +31,6 @@ impl InteriorSolver for RoeM1D {
         let first = self.0.first;
         let n_real = self.0.n_real;
         let PipeState {
-            q0,
             phi,
             f,
             df,
@@ -62,9 +62,9 @@ impl InteriorSolver for RoeM1D {
 
             //difference between neighboring cell states
             let dq: Matrix3x1<f64> = Matrix3x1::new(
-                q0[(0, ir)] - q0[(0, il)], // d(rho)
-                q0[(1, ir)] - q0[(1, il)], // d(rho*u)
-                q0[(2, ir)] - q0[(2, il)], // d(rho*E)
+                q[(0, ir)] - q[(0, il)], // d(rho)
+                q[(1, ir)] - q[(1, il)], // d(rho*u)
+                q[(2, ir)] - q[(2, il)], // d(rho*E)
             );
 
             //RoeM Changes ==================================================
