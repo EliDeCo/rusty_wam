@@ -1,24 +1,29 @@
-// The MUSCL limiter system is based on the kappa = 1/3, finite volume MUSCL scheme
-// from the following papers
+// The kappa = 1/3 finite volume MUSCL scheme, which is third order accurate, limited by
+// Cada & Torrilhon's compact third-order limiter so that it stays third order at smooth
+// extrema instead of clipping them. See validation/MusclRoeM1D.md
 // https://doi.org/10.1016/j.jcp.2021.110640
-// https://doi.org/10.22055/jacm.2020.32845.2088
+// https://doi.org/10.1016/j.jcp.2009.02.020
 //
-// The flux is the same RoeM2 scheme used by RoeM1D, applied to the reconstructed
-// left/right face states instead of to neighbouring cell averages.
+// The flux is the same RoeM flux as RoeM1D, applied to the reconstructed left/right face
+// states instead of to neighbouring cell averages.
 
 use crate::pipes::{BoundaryPair, InteriorSolver, PipeState};
 use nalgebra::{Matrix1xX, Matrix3, Matrix3x1, Matrix3xX};
 use std::ops::AddAssign;
 
-const KAPPA: f64 = 1.0 / 3.0; // MUSCL blend parameter
-const C_M: f64 = (1.0 - KAPPA) / 4.0; // weight on the "backward" difference
-const C_P: f64 = (1.0 + KAPPA) / 4.0; // weight on the "forward" difference
+///MUSCL blend parameter. The limiter's bounds are derived for 1/3 and only this value
+/// is third order accurate, so it is fixed rather than a knob.
+const KAPPA: f64 = 1.0 / 3.0;
+
+///Radius of the asymptotic region, dimensionless because the indicator below divides by
+/// each row's own acoustic scale. Measured, not fitted: see validation/MusclRoeM1D.md
+const R_SMOOTH: f64 = 1.0;
 
 const RECONSTRUCT_PRIMITIVE: bool = false;
 // false = reconstruct conserved (verified 3rd order);
 // true = reconstruct primitive (more robust, expect ~2nd order on nonlinear problems)
 
-///Bundles everything `decode_state` + `euler_flux` produce, so the RoeM2 face loop can
+///Bundles everything `decode_state` + `euler_flux` produce, so the RoeM face loop can
 /// be called on either cell blocks or face blocks without a different function for each.
 /// All fields have the same width.
 struct Decoded {
@@ -46,13 +51,12 @@ impl Decoded {
 ///Scratch buffers for one residual evaluation, sized once outside the time loop
 /// (same preallocation style as the rest of the solver).
 struct Workspace {
-    dq: Matrix3xX<f64>,   // n_total - 1
-    qmin: Matrix3xX<f64>, // n_total - 2
-    qmax: Matrix3xX<f64>, // n_total - 2
-    q_l: Matrix3xX<f64>,  // n_faces
-    q_r: Matrix3xX<f64>,  // n_faces
-    wl: Decoded,          // n_faces - primitives/flux decoded from q_l
-    wr: Decoded,          // n_faces - primitives/flux decoded from q_r
+    dq: Matrix3xX<f64>,    // n_total - 1
+    scale: Matrix3xX<f64>, // n_total - what the smoothness indicator divides by
+    q_l: Matrix3xX<f64>,   // n_faces
+    q_r: Matrix3xX<f64>,   // n_faces
+    wl: Decoded,           // n_faces - primitives/flux decoded from q_l
+    wr: Decoded,           // n_faces - primitives/flux decoded from q_r
 
     //primitives section
     prim: Matrix3xX<f64>, // n_total -- only touched when RECONSTRUCT_PRIMITIVE
@@ -64,8 +68,7 @@ impl Workspace {
     fn new(n_total: usize, n_faces: usize) -> Self {
         Workspace {
             dq: Matrix3xX::zeros(n_total - 1),
-            qmin: Matrix3xX::zeros(n_total - 2),
-            qmax: Matrix3xX::zeros(n_total - 2),
+            scale: Matrix3xX::zeros(n_total),
             q_l: Matrix3xX::zeros(n_faces),
             q_r: Matrix3xX::zeros(n_faces),
             wl: Decoded::zeros(n_faces),
@@ -77,23 +80,71 @@ impl Workspace {
     }
 }
 
-///Componentwise min/max of q over the 3-cell window {i-1, i, i+1}
-/// This is the Barth-Jespersen-style monotonicity bound: it defines how far a face
-/// value can be pushed away from the cell average before it would create information
-/// that didn't exist in any of the three cells feeding the reconstruction.
-fn compute_windows(q: &Matrix3xX<f64>, qmin: &mut Matrix3xX<f64>, qmax: &mut Matrix3xX<f64>) {
-    let n_slope = qmin.ncols();
-    debug_assert_eq!(qmax.ncols(), n_slope);
-    debug_assert_eq!(q.ncols(), n_slope + 2);
+///The unlimited reconstruction written as a limiter, which is what makes it comparable
+/// with the shock-capturing branch below. At kappa = 1/3 this is Cada's (2 + theta)/3.
+fn phi_3(theta: f64) -> f64 {
+    0.5 * ((1.0 - KAPPA) * theta + (1.0 + KAPPA))
+}
 
-    for row in 0..3 {
-        for i in 0..n_slope {
-            let left = q[(row, i)];
-            let center = q[(row, i + 1)];
-            let right = q[(row, i + 2)];
-            qmin[(row, i)] = left.min(center).min(right);
-            qmax[(row, i)] = left.max(center).max(right);
-        }
+///Cada's shock-capturing branch: the parabola, bounded so it cannot introduce variation
+/// where the data is not monotone.
+fn phi_hat(theta: f64) -> f64 {
+    let p3 = phi_3(theta);
+    let inner = (2.0 * theta).min(p3).min(1.6);
+    p3.min((-0.5 * theta).max(inner)).max(0.0)
+}
+
+///Cada's limiter: the parabola inside the asymptotic region, the bounded branch outside
+/// it, blended across a machine-width band so the numerical flux stays Lipschitz.
+/// `ref_step` is R*dx scaled by the row's acoustic size, so eta is a pure number.
+fn phi_limited(d_far: f64, d_near: f64, ref_step: f64) -> f64 {
+    const EPS: f64 = 1.0e-12;
+    let eta = (d_far * d_far + d_near * d_near) / (ref_step * ref_step);
+    let theta = d_far / d_near;
+
+    if eta <= 1.0 - EPS {
+        phi_3(theta)
+    } else if eta >= 1.0 + EPS {
+        phi_hat(theta)
+    } else {
+        let w = (eta - 1.0) / EPS;
+        0.5 * ((1.0 - w) * phi_3(theta) + (1.0 + w) * phi_hat(theta))
+    }
+}
+
+///Half-step from a cell average to one of its faces. A zero near-difference means the
+/// face sits at the cell value, and short-circuiting it keeps theta away from 0/0.
+fn face_step(d_near: f64, d_far: f64, ref_step: f64) -> f64 {
+    if d_near == 0.0 {
+        return 0.0;
+    }
+    0.5 * phi_limited(d_far, d_near, ref_step) * d_near
+}
+
+///Reference step the smoothness indicator measures a difference against, per cell and
+/// per row: R*dx times the row's acoustic size. Dividing by it is what makes a threshold
+/// of one mean the same thing in a row of kg/m3 and a row of J/m3. Conserved rows scale
+/// as (rho, rho a, rho a^2), primitive rows as (rho, a, rho a^2).
+fn fill_scales(
+    q: &Matrix3xX<f64>,
+    scale: &mut Matrix3xX<f64>,
+    dx: f64,
+    gamma: f64,
+    primitive: bool,
+) {
+    for col in 0..q.ncols() {
+        let rho = q[(0, col)];
+        let p = if primitive {
+            q[(2, col)]
+        } else {
+            (gamma - 1.0) * (q[(2, col)] - 0.5 * q[(1, col)] * q[(1, col)] / rho)
+        };
+        let a = (gamma * p / rho).sqrt();
+        let middle = if primitive { a } else { rho * a };
+
+        scale[(0, col)] = R_SMOOTH * dx * rho;
+        scale[(1, col)] = R_SMOOTH * dx * middle;
+        scale[(2, col)] = R_SMOOTH * dx * rho * a * a;
     }
 }
 
@@ -153,10 +204,9 @@ fn cell_differences(q: &Matrix3xX<f64>, dq: &mut Matrix3xX<f64>) {
 fn reconstruct(
     q: &Matrix3xX<f64>,
     dq: &Matrix3xX<f64>,
+    scale: &Matrix3xX<f64>,
     q_l: &mut Matrix3xX<f64>,
     q_r: &mut Matrix3xX<f64>,
-    qmin: &Matrix3xX<f64>,
-    qmax: &Matrix3xX<f64>,
     first: usize,
 ) {
     let n_faces = q_l.ncols();
@@ -168,38 +218,19 @@ fn reconstruct(
         first + n_faces <= dq.ncols(),
         "reconstruction stencil runs past the padded array"
     );
-    debug_assert!(
-        first - 1 + n_faces <= qmin.ncols(),
-        "window stencil runs past the padded array"
-    );
 
-    // Left state at face k: extrapolated FORWARD from cell first-1+k, using that cell's
-    // own backward difference dq[first-2+k] and forward difference dq[first-1+k]
-    q_l.copy_from(&q.columns(first - 1, n_faces));
-    q_l.zip_zip_apply(
-        &dq.columns(first - 2, n_faces), // backward difference of the left cell
-        &dq.columns(first - 1, n_faces), // forward difference of the left cell
-        |ql, d_minus, d_plus| *ql += C_M * d_minus + C_P * d_plus,
-    );
+    for k in 0..n_faces {
+        // the left state extrapolates forward out of cell first-1+k, the right state
+        // backward out of cell first+k, each limited against its own cell's scale
+        let (left, right) = (first - 1 + k, first + k);
 
-    // Right state at face k: extrapolated BACKWARD from cell first+k, using that cell's
-    // own backward difference dq[first-1+k] and forward difference dq[first+k]
-    q_r.copy_from(&q.columns(first, n_faces));
-    q_r.zip_zip_apply(
-        &dq.columns(first - 1, n_faces), // backward difference of the right cell
-        &dq.columns(first, n_faces),     // forward difference of the right cell
-        |qr, d_minus, d_plus| *qr -= C_P * d_minus + C_M * d_plus,
-    );
+        for row in 0..3 {
+            let back = dq[(row, first - 2 + k)]; // backward difference of the left cell
+            let mid = dq[(row, first - 1 + k)]; // shared by both cells
+            let fwd = dq[(row, first + k)]; // forward difference of the right cell
 
-    // clamp the generated left and right states based on the limits defined by
-    // compute_windows in order to stop nonphysical information spread.
-    // qmin/qmax are indexed by (cell index - 1).
-    for row in 0..3 {
-        for k in 0..n_faces {
-            let wl = first - 2 + k; // window of the left cell  (first-1+k)
-            let wr = first - 1 + k; // window of the right cell (first+k)
-            q_l[(row, k)] = q_l[(row, k)].clamp(qmin[(row, wl)], qmax[(row, wl)]);
-            q_r[(row, k)] = q_r[(row, k)].clamp(qmin[(row, wr)], qmax[(row, wr)]);
+            q_l[(row, k)] = q[(row, left)] + face_step(mid, back, scale[(row, left)]);
+            q_r[(row, k)] = q[(row, right)] - face_step(mid, fwd, scale[(row, right)]);
         }
     }
 }
@@ -268,7 +299,7 @@ fn enforce_positivity(
     }
 }
 
-///Calculates the RoeM2 flux at every face given the LEFT and RIGHT reconstructed
+///Calculates the RoeM flux at every face given the LEFT and RIGHT reconstructed
 /// states. This is face flux F, NOT the flux difference.
 fn roe_flux(
     q_l: &Matrix3xX<f64>,
@@ -316,13 +347,12 @@ fn roe_flux(
         let dq: Matrix3x1<f64> = q_r.column(k) - q_l.column(k);
 
         let u_l = wl.u[k]; // left veloctity
-        let a_l = (gamma * wl.p[k] / wl.rho[k]).sqrt(); // left speed of sound
         let u_r = wr.u[k]; // right velocity
-        let a_r = (gamma * wr.p[k] / wr.rho[k]).sqrt(); // right speed of sound
 
-        //intermediates
-        let b1 = lambda[2].max((u_r + a_r).max(0.0));
-        let b2 = lambda[0].min((u_l - a_l).min(0.0));
+        //Eq 33: the signal velocities take the common speed of sound, which is what
+        //lets a contact be captured exactly whichever side is the hotter
+        let b1 = lambda[2].max((u_r + roe_a).max(0.0));
+        let b2 = lambda[0].min((u_l - roe_a).min(0.0));
         let b3 = b1 + b2;
         let b4 = 2.0 * b1 * b2;
         let b5 = 1.0 / (b1 - b2);
@@ -410,35 +440,21 @@ fn fill_phi(
     ws: &mut Workspace,
     phi: &mut Matrix3xX<f64>,
     first: usize,
+    dx: f64,
     gamma: f64,
 ) {
     if RECONSTRUCT_PRIMITIVE {
         conserved_block_to_primitive(q, &mut ws.prim, gamma);
         cell_differences(&ws.prim, &mut ws.dq);
-        compute_windows(&ws.prim, &mut ws.qmin, &mut ws.qmax);
-        reconstruct(
-            &ws.prim,
-            &ws.dq,
-            &mut ws.w_l,
-            &mut ws.w_r,
-            &ws.qmin,
-            &ws.qmax,
-            first,
-        );
+        fill_scales(&ws.prim, &mut ws.scale, dx, gamma, true);
+        reconstruct(&ws.prim, &ws.dq, &ws.scale, &mut ws.w_l, &mut ws.w_r, first);
         primitive_block_to_conserved(&ws.w_l, &mut ws.q_l, gamma);
         primitive_block_to_conserved(&ws.w_r, &mut ws.q_r, gamma);
     } else {
         cell_differences(q, &mut ws.dq); //calculates dq
-        compute_windows(q, &mut ws.qmin, &mut ws.qmax); //compute bounds for left and right states
-        reconstruct(
-            q,
-            &ws.dq,
-            &mut ws.q_l,
-            &mut ws.q_r,
-            &ws.qmin,
-            &ws.qmax,
-            first,
-        ); //reconstructs q_l and q_r using peicewise linear scheme
+        fill_scales(q, &mut ws.scale, dx, gamma, false);
+        //reconstructs q_l and q_r, limited so smooth extrema keep third order
+        reconstruct(q, &ws.dq, &ws.scale, &mut ws.q_l, &mut ws.q_r, first);
     }
 
     enforce_positivity(q, &mut ws.q_l, &mut ws.q_r, first, gamma); // last line of defense before the flux
@@ -446,7 +462,7 @@ fn fill_phi(
     roe_flux(&ws.q_l, &ws.q_r, &mut ws.wl, &mut ws.wr, phi, gamma); //calculates the roe flux through each face
 }
 
-///Third order MUSCL reconstruction around the RoeM2 flux.
+///Third order MUSCL reconstruction around the RoeM flux.
 pub struct MusclRoeM1D {
     shared: PipeState,
     ws: Workspace,
@@ -470,10 +486,9 @@ impl InteriorSolver for MusclRoeM1D {
     ///One residual evaluation for the state q, in the shared df convention.
     /// Decodes its own face states, so it never touches the shared primitives.
     fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair) {
-        let (first, gamma) = (self.shared.first, self.shared.gamma);
+        let (first, dx, gamma) = (self.shared.first, self.shared.dx, self.shared.gamma);
         let Self { shared, ws, .. } = self;
-        fill_phi(q, ws, &mut shared.phi, first, gamma);
+        fill_phi(q, ws, &mut shared.phi, first, dx, gamma);
         shared.difference_flux(bc);
     }
-
 }

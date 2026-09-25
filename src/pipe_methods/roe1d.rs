@@ -29,12 +29,7 @@ impl InteriorSolver for Roe1D {
         let gamma = self.0.gamma;
         let first = self.0.first;
         let PipeState {
-            phi,
-            f,
-            rho,
-            u,
-            h,
-            ..
+            phi, f, rho, u, h, ..
         } = &mut self.0;
 
         //loop over each cell interface (column in phi)

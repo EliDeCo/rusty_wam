@@ -1,5 +1,7 @@
-// This impliments a 1D version of the RoeM2 scheme from the following paper,
-// with the exception of the f and g functions which only give benefits in higher dimensions
+// This impliments a 1D RoeM flux from the following paper: Eq 27a-c with the signal
+// velocities of Eq 33. The f and g of Eq 17b and 20b are omitted, since testing against
+// exact solutions showed they only act on captured discontinuities in 1D, and the shock
+// instability they exist to cure is a multi-dimensional one. See validation/RoeM1D.md
 // https://doi.org/10.1016/S0021-9991(02)00037-2
 
 use crate::pipes::{BoundaryPair, InteriorSolver, PipeState};
@@ -67,13 +69,12 @@ impl InteriorSolver for RoeM1D {
 
             //RoeM Changes ==================================================
             let u_l = u[il]; // left veloctity
-            let a_l = (gamma * p[il] / rho[il]).sqrt(); // left speed of sound
             let u_r = u[ir]; // right velocity
-            let a_r = (gamma * p[ir] / rho[ir]).sqrt(); // right speed of sound
 
-            //intermediates
-            let b1 = lambda[2].max((u_r + a_r).max(0.0));
-            let b2 = lambda[0].min((u_l - a_l).min(0.0));
+            //Eq 33: the signal velocities take the common speed of sound, which is what
+            //lets a contact be captured exactly whichever side is the hotter
+            let b1 = lambda[2].max((u_r + roe_a).max(0.0));
+            let b2 = lambda[0].min((u_l - roe_a).min(0.0));
             let b3 = b1 + b2;
             let b4 = 2.0 * b1 * b2;
             let b5 = 1.0 / (b1 - b2);

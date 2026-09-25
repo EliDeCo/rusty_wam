@@ -2,7 +2,7 @@
 // codimension is the number of characteristics entering the domain, and the boundary state
 // is where the interior's outgoing wave meets it. The face then takes the plain Euler flux
 // of that state, so the prescribed quantity is satisfied exactly rather than relaxed toward.
-// https://arxiv.org/abs/1101.2752
+// https://doi.org/10.48550/arXiv.1101.2752
 
 use nalgebra::Vector3;
 
@@ -22,6 +22,8 @@ pub enum BoundaryCondition {
     Atmosphere { p: f64, rho: f64 },
     ///lets waves leave without returning, against the state this end started in
     NonReflecting,
+    ///a solid end that no mass crosses
+    Wall,
 }
 
 ///Density, velocity and pressure of one conservative state.
@@ -34,7 +36,11 @@ fn decode(q: &Vector3<f64>, gamma: f64) -> (f64, f64, f64) {
 
 ///Packs density, velocity and pressure back into a conservative state.
 pub(crate) fn pack(rho: f64, u: f64, p: f64, gamma: f64) -> Vector3<f64> {
-    Vector3::new(rho, rho * u, rho * (p / ((gamma - 1.0) * rho) + 0.5 * u * u))
+    Vector3::new(
+        rho,
+        rho * u,
+        rho * (p / ((gamma - 1.0) * rho) + 0.5 * u * u),
+    )
 }
 
 ///Euler flux of one conservative state, which is what a resolved end hands its face.
@@ -62,8 +68,9 @@ pub fn boundary_state(
     let (rho_i, u_i, p_i) = decode(interior, gamma);
     let w = Outward::new(rho_i, s * u_i, p_i, gamma);
 
-    //a supersonic outflow admits no datum, so the interior passes straight through
-    if w.v >= w.a {
+    //a wall is solid, not fluid, so it turns the flow around at any speed; every other
+    //end admits no datum once its outflow goes supersonic and passes the interior through
+    if w.v >= w.a && !matches!(bc, BoundaryCondition::Wall) {
         return *interior;
     }
 
@@ -72,6 +79,7 @@ pub fn boundary_state(
         BoundaryCondition::MassOutflow { mdot } => w.at_mass_flux(mdot / area),
         BoundaryCondition::MassInflow { mdot, h0 } => w.at_jet(-mdot / area, h0),
         BoundaryCondition::Atmosphere { p, rho } => w.at_atmosphere(p, rho),
+        BoundaryCondition::Wall => w.at_velocity(0.0),
         BoundaryCondition::NonReflecting => {
             let (rho_r, u_r, p_r) = decode(reference, gamma);
             w.at_invariant(rho_r, s * u_r, p_r)
@@ -173,6 +181,26 @@ impl Outward {
             a,
             self.p * ratio.powf(2.0 * g / (g - 1.0)),
         )
+    }
+
+    ///Boundary state whose wave brings the outward velocity to a target, which is the
+    /// rigid wall of Eq 3.5.11 once that target is zero.
+    fn at_velocity(&self, target: f64) -> (f64, f64, f64) {
+        let g = self.gamma;
+        assert!(
+            self.v > target - 2.0 * self.a / (g - 1.0),
+            "a wall this end is racing away from would cavitate"
+        );
+
+        //velocity falls with pressure along the wave curve, so doubling always brackets
+        let mut hi = self.p * 2.0;
+        while self.v_at(hi) > target {
+            hi *= 2.0;
+        }
+
+        let p = root(0.0, hi, |p| (self.v_at(p) - target, -self.df(p)));
+
+        (self.rho_at(p), target, p)
     }
 
     ///Boundary state carrying a prescribed outward mass flux, saturating at the sonic

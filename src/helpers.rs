@@ -32,9 +32,6 @@ pub fn plot(y: &[f64], iteration: u32, pipe_id: usize, chart: &ChartDetails) {
 }
 
 /// True when a density or pressure is not a usable physical value.
-/// Written as `!is_finite() || <= 0.0` rather than `< 0.0` so that NaN and infinity
-/// are caught too - NaN fails every ordinary comparison, so `x < 0.0` silently
-/// passes it through.
 pub fn unphysical(x: f64) -> bool {
     !x.is_finite() || x <= 0.0
 }

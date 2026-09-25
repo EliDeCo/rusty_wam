@@ -1,3 +1,6 @@
+// This impliments the ghost junction method from Hong & Kim, 2011
+//https://doi.org/10.1002/fld.2212,
+
 use crate::helpers::unphysical;
 use crate::pipes::InteriorMethod;
 use nalgebra::{Matrix3xX, Vector3, Vector5};
@@ -181,8 +184,7 @@ impl Junction {
 
             //add velocity vector in normal direction scaled by pipe's velocity
             velocities.push(inlet.normal * u * multiplier);
-            pressures
-                .push((self.gamma - 1.0) * (states[(2, i)] - 0.5 * states[(0, i)] * u * u));
+            pressures.push((self.gamma - 1.0) * (states[(2, i)] - 0.5 * states[(0, i)] * u * u));
             areas.push(inlet.area);
         }
 
@@ -256,10 +258,10 @@ pub fn ghost_state(
     Vector3::new(rho, rho * u_axial, rho * e_g)
 }
 
-// The junction interface uses the same RoeM2 scheme as roem1d.rs, widened to the three
-// momentum components a ghost junction cell carries. Assembled in the paper's compact
-// form (Eq. 40a) rather than through eigenvectors, which is the same algebra without a
-// 5x5 inverse. f_c and g_c are omitted for the reason roem1d.rs omits them: they suppress
+// The junction interface uses the same RoeM flux as roem1d.rs, widened to the three
+// momentum components a ghost junction cell carries.
+// Assembled in the paper's compact form (Eq. 40a) rather than through eigenvectors, which
+// is the same algebra without a 5x5 inverse. f_c and g_c are omitted because they suppress
 // the carbuncle, which needs a shock spanning several cells across the front, and a
 // junction is one control volume with independent two-state interfaces.
 // https://doi.org/10.1002/fld.2212
@@ -323,12 +325,10 @@ fn roem5(q_l: &Vector5<f64>, q_r: &Vector5<f64>, n: &Vector3<f64>, gamma: f64) -
     let roe_un = roe_vel.dot(n); // Roe average normal velocity
 
     //RoeM Changes ==================================================
-    let a_l = (gamma * p_l / rho_l).sqrt(); // left speed of sound
-    let a_r = (gamma * p_r / rho_r).sqrt(); // right speed of sound
-
-    //intermediates
-    let b1 = (roe_un + roe_a).max((un_r + a_r).max(0.0));
-    let b2 = (roe_un - roe_a).min((un_l - a_l).min(0.0));
+    //Eq 33: the signal velocities take the common speed of sound, which is what
+    //lets a contact be captured exactly whichever side is the hotter
+    let b1 = (roe_un + roe_a).max((un_r + roe_a).max(0.0));
+    let b2 = (roe_un - roe_a).min((un_l - roe_a).min(0.0));
     let b5 = 1.0 / (b1 - b2);
 
     //other quantities

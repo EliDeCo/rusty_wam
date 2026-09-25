@@ -161,7 +161,9 @@ impl PipeState {
             self.phi.set_column(self.n_real, &flux);
         }
 
-        let Self { phi, df, n_real, .. } = self;
+        let Self {
+            phi, df, n_real, ..
+        } = self;
         phi.columns(1, *n_real).sub_to(&phi.columns(0, *n_real), df);
     }
 
@@ -438,7 +440,6 @@ impl InteriorMethod {
     pub fn id(&self) -> usize {
         self.solver().state().id
     }
-
 }
 
 ///Largest signal speed over the real cells only.
@@ -449,7 +450,6 @@ fn max_wave_speed(u: &Matrix1xX<f64>, a: &Matrix1xX<f64>, first: usize, n_real: 
         .zip(a.as_slice()[real].iter())
         .fold(0.0_f64, |speed, (&ui, &ai)| speed.max(ui.abs() + ai))
 }
-
 
 ///Decodes a conservative state into density, velocity, energy, pressure and enthalpy.
 /// One value per cell, ghosts included, since the face loops read primitives there too.

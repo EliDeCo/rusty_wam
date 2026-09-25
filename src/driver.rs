@@ -1,8 +1,6 @@
 use crate::boundaries::{BoundaryCondition, boundary_state, euler_flux};
 use crate::junctions::{Junction, ghost_state, interface_flux};
-use crate::pipes::{
-    BoundaryPair, InteriorMethod, PipeState, TimeIntegrator, apply_bc, rk_stage,
-};
+use crate::pipes::{BoundaryPair, InteriorMethod, PipeState, TimeIntegrator, apply_bc, rk_stage};
 use nalgebra::{Matrix3xX, Vector3, Vector5};
 use std::collections::BTreeMap;
 
@@ -107,7 +105,10 @@ impl Driver {
             })
             .collect();
 
-        let bc = pipes.keys().map(|&id| (id, BoundaryPair::default())).collect();
+        let bc = pipes
+            .keys()
+            .map(|&id| (id, BoundaryPair::default()))
+            .collect();
         let ends = resolve_ends(pipes, junctions);
 
         Self {
@@ -136,7 +137,11 @@ impl Driver {
 
         for end in ends.iter() {
             let p_regs = &pipe_regs[&end.pipe];
-            let p_state = if k == 0 { &p_regs.qn } else { &p_regs.stages[k - 1] };
+            let p_state = if k == 0 {
+                &p_regs.qn
+            } else {
+                &p_regs.stages[k - 1]
+            };
             let interior = Vector3::new(
                 p_state[(0, end.cell)],
                 p_state[(1, end.cell)],
@@ -150,7 +155,11 @@ impl Driver {
                     normal,
                 } => {
                     let j_regs = &junction_regs[junction];
-                    let j_state = if k == 0 { j_regs.qn } else { j_regs.stages[k - 1] };
+                    let j_state = if k == 0 {
+                        j_regs.qn
+                    } else {
+                        j_regs.stages[k - 1]
+                    };
                     let (f_3d, f_1d) =
                         interface_flux(&j_state, &interior, normal, end.left, end.gamma);
 
@@ -167,7 +176,12 @@ impl Driver {
                 }
                 EndKind::Prescribed(bc) => {
                     let ghost = boundary_state(
-                        &interior, &end.reference, bc, end.area, end.gamma, end.left,
+                        &interior,
+                        &end.reference,
+                        bc,
+                        end.area,
+                        end.gamma,
+                        end.left,
                     );
 
                     (ghost, Some(euler_flux(&ghost, end.gamma)))
@@ -292,7 +306,17 @@ impl Driver {
                 let (done, rest) = bufs.split_at_mut(k);
                 let dst = &mut rest[0];
                 let src = if k == 0 { &*qn } else { &done[k - 1] };
-                rk_stage(dst, qn, src, &pipe.solver().state().df, a, b, c, first, n_real);
+                rk_stage(
+                    dst,
+                    qn,
+                    src,
+                    &pipe.solver().state().df,
+                    a,
+                    b,
+                    c,
+                    first,
+                    n_real,
+                );
             }
         }
     }
@@ -320,8 +344,7 @@ fn resolve_ends(
                         .position(|inlet| inlet.pipe_id == pipe)
                         .expect("junction does not list the pipe that names it");
                     assert_eq!(
-                        j.pipes[index].left,
-                        left,
+                        j.pipes[index].left, left,
                         "pipe {pipe} and junction {junction} disagree on which end they meet at"
                     );
 
