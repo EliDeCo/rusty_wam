@@ -6,7 +6,7 @@
 // The flux is the same RoeM2 scheme used by RoeM1D, applied to the reconstructed
 // left/right face states instead of to neighbouring cell averages.
 
-use crate::pipes::{InteriorSolver, PipeState};
+use crate::pipes::{BoundaryPair, InteriorSolver, PipeState};
 use nalgebra::{Matrix1xX, Matrix3, Matrix3x1, Matrix3xX};
 use std::ops::AddAssign;
 
@@ -53,7 +53,6 @@ struct Workspace {
     q_r: Matrix3xX<f64>,  // n_faces
     wl: Decoded,          // n_faces - primitives/flux decoded from q_l
     wr: Decoded,          // n_faces - primitives/flux decoded from q_r
-    phi: Matrix3xX<f64>,  // n_faces - numerical flux at each face
 
     //primitives section
     prim: Matrix3xX<f64>, // n_total -- only touched when RECONSTRUCT_PRIMITIVE
@@ -71,7 +70,6 @@ impl Workspace {
             q_r: Matrix3xX::zeros(n_faces),
             wl: Decoded::zeros(n_faces),
             wr: Decoded::zeros(n_faces),
-            phi: Matrix3xX::zeros(n_faces),
             prim: Matrix3xX::zeros(n_total),
             w_l: Matrix3xX::zeros(n_faces),
             w_r: Matrix3xX::zeros(n_faces),
@@ -405,18 +403,13 @@ fn roe_flux(
     });
 }
 
-///Ties reconstruction + the Riemann solve + the flux divergence together for every
-/// real cell. q must already have its ghosts filled by apply_bc.
-///
-/// Writes the RAW flux difference phi[k+1] - phi[k] into df, matching the convention
-/// every other interior method uses -- `advance` (or the RK3 stages below) supply the
-/// -(dt/dx) scaling.
-fn residual(
+///Ties reconstruction and the Riemann solve together, filling phi at every face.
+/// q must already have its ghosts filled by apply_bc.
+fn fill_phi(
     q: &Matrix3xX<f64>,
     ws: &mut Workspace,
-    df: &mut Matrix3xX<f64>,
+    phi: &mut Matrix3xX<f64>,
     first: usize,
-    n_real: usize,
     gamma: f64,
 ) {
     if RECONSTRUCT_PRIMITIVE {
@@ -450,12 +443,7 @@ fn residual(
 
     enforce_positivity(q, &mut ws.q_l, &mut ws.q_r, first, gamma); // last line of defense before the flux
 
-    roe_flux(&ws.q_l, &ws.q_r, &mut ws.wl, &mut ws.wr, &mut ws.phi, gamma); //calculates the roe flux through each face
-
-    // df_j = phi_{j+1/2} - phi_{j-1/2} for every real cell j
-    ws.phi
-        .columns(1, n_real)
-        .sub_to(&ws.phi.columns(0, n_real), df);
+    roe_flux(&ws.q_l, &ws.q_r, &mut ws.wl, &mut ws.wr, phi, gamma); //calculates the roe flux through each face
 }
 
 ///Third order MUSCL reconstruction around the RoeM2 flux.
@@ -481,10 +469,11 @@ impl InteriorSolver for MusclRoeM1D {
 
     ///One residual evaluation for the state q, in the shared df convention.
     /// Decodes its own face states, so it never touches the shared primitives.
-    fn residual(&mut self, q: &Matrix3xX<f64>) {
-        let (first, n_real, gamma) = (self.shared.first, self.shared.n_real, self.shared.gamma);
+    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair) {
+        let (first, gamma) = (self.shared.first, self.shared.gamma);
         let Self { shared, ws, .. } = self;
-        residual(q, ws, &mut shared.df, first, n_real, gamma);
+        fill_phi(q, ws, &mut shared.phi, first, gamma);
+        shared.difference_flux(bc);
     }
 
 }

@@ -1,7 +1,7 @@
 // This implimentation is based on P.S. Volpani's "07_1D_Euler_equations_Roe" example
 //https://github.com/psvolpiani/YouTube-CFD-101
 
-use crate::pipes::{InteriorSolver, PipeState};
+use crate::pipes::{BoundaryPair, InteriorSolver, PipeState};
 use nalgebra::{Matrix3, Matrix3x1, Matrix3xX};
 
 pub struct Roe1D(PipeState);
@@ -21,18 +21,16 @@ impl InteriorSolver for Roe1D {
     }
 
     ///Calculates the Roe1D flux at every interface, then differences it into df.
-    fn residual(&mut self, q: &Matrix3xX<f64>) {
+    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair) {
         self.0.decode_from(q);
         self.0.euler_flux();
 
         //copy the scalars out first so the buffers below can be split-borrowed
         let gamma = self.0.gamma;
         let first = self.0.first;
-        let n_real = self.0.n_real;
         let PipeState {
             phi,
             f,
-            df,
             rho,
             u,
             h,
@@ -111,7 +109,6 @@ impl InteriorSolver for Roe1D {
             col.copy_from(&(0.5 * (f.column(il) + f.column(ir)) - 0.5 * dissipation));
         });
 
-        // Flux divergence per interior cell: phi_{i+1/2} - phi_{i-1/2}
-        phi.columns(1, n_real).sub_to(&phi.columns(0, n_real), df);
+        self.0.difference_flux(bc);
     }
 }

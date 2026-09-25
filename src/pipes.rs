@@ -1,45 +1,41 @@
+use crate::boundaries::BoundaryCondition;
 use crate::helpers::unphysical;
 use crate::pipe_methods::{muscl_roem1d::MusclRoeM1D, roe1d::Roe1D, roem1d::RoeM1D};
-use nalgebra::{Matrix1xX, Matrix3xX};
+use nalgebra::{Matrix1xX, Matrix3xX, Vector3};
 use std::ops::AddAssign;
 
-///How the ghost cells on one end of a pipe are refilled every time the state moves.
-#[derive(Clone, Copy)]
-pub enum BoundaryCondition {
-    ///zero-gradient: waves pass through the end undisturbed
-    Transmissive,
-    ///Connected to a junction with the given id
-    Junction(usize),
+///What a junction supplies to one end of a pipe for a single stage.
+/// The driver resolves both from the junction's stage state, so nothing here knows of junctions.
+#[derive(Clone, Copy, Default)]
+pub struct BoundaryData {
+    ///numerical flux forced onto that end's face
+    pub flux: Option<Vector3<f64>>,
+    ///conservative state that end's ghost cells are filled with
+    pub ghost: Option<Vector3<f64>>,
 }
 
-///Refills the ghost cells on each end so every real cell uses the same stencil.
-/// `None` leaves that end untouched, which reproduces a fixed boundary.
-pub(crate) fn apply_bc(
-    q: &mut Matrix3xX<f64>,
-    first: usize,
-    n_real: usize,
-    n_ghost: usize,
-    left: Option<BoundaryCondition>,
-    right: Option<BoundaryCondition>,
-) {
+///The boundary data for both ends of one pipe.
+#[derive(Clone, Copy, Default)]
+pub struct BoundaryPair {
+    pub left: BoundaryData,
+    pub right: BoundaryData,
+}
+
+///Refills the ghost cells on each end with the state the driver resolved there.
+/// An end with nothing resolved is left untouched, which holds it fixed.
+pub(crate) fn apply_bc(q: &mut Matrix3xX<f64>, n_ghost: usize, bc: &BoundaryPair) {
     let n_total = q.ncols();
 
-    if let Some(BoundaryCondition::Transmissive) = left {
-        let mirror = q.column(first).into_owned();
+    if let Some(fill) = bc.left.ghost {
         for g in 0..n_ghost {
-            q.set_column(g, &mirror);
+            q.set_column(g, &fill);
         }
-    } else if let Some(BoundaryCondition::Junction(id)) = left {
-        //TODO: Impliment
     }
 
-    if let Some(BoundaryCondition::Transmissive) = right {
-        let mirror = q.column(first + n_real - 1).into_owned();
+    if let Some(fill) = bc.right.ghost {
         for g in 0..n_ghost {
-            q.set_column(n_total - 1 - g, &mirror);
+            q.set_column(n_total - 1 - g, &fill);
         }
-    } else if let Some(BoundaryCondition::Junction(id)) = right {
-        //TODO: Impliment
     }
 }
 
@@ -107,10 +103,10 @@ impl PipeState {
         let n_total = n_real + 2 * n_ghost;
         let n_faces = n_real + 1;
 
-        //pad the initial condition into the full array, then fill the ghosts
+        //pad the initial condition into the full array; the driver fills the ghosts
+        //before the first residual, so nothing here has to guess at them
         let mut q1: Matrix3xX<f64> = Matrix3xX::zeros(n_total);
         q1.columns_mut(first, n_real).copy_from(&state);
-        apply_bc(&mut q1, first, n_real, n_ghost, left_bc, right_bc);
 
         let placeholder = Matrix1xX::zeros(n_total);
 
@@ -153,6 +149,20 @@ impl PipeState {
             ..
         } = self;
         decode_into(q1, rho, u, e, p, h, *gamma);
+    }
+
+    ///Forces any supplied flux onto the two boundary faces, then differences phi into df.
+    /// Every interior method fills phi and then ends here, so injection has one home.
+    pub(crate) fn difference_flux(&mut self, bc: &BoundaryPair) {
+        if let Some(flux) = bc.left.flux {
+            self.phi.set_column(0, &flux);
+        }
+        if let Some(flux) = bc.right.flux {
+            self.phi.set_column(self.n_real, &flux);
+        }
+
+        let Self { phi, df, n_real, .. } = self;
+        phi.columns(1, *n_real).sub_to(&phi.columns(0, *n_real), df);
     }
 
     ///Decodes an externally held state into the shared primitive buffers.
@@ -263,7 +273,7 @@ pub trait InteriorSolver {
 
     ///Fills state.df with the raw flux difference phi[k+1] - phi[k] for the state q.
     /// The driver supplies the -(dt/dx) scaling, so every method writes df alike.
-    fn residual(&mut self, q: &Matrix3xX<f64>);
+    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair);
 }
 
 ///Selects which interior method InteriorMethod::new constructs
@@ -357,7 +367,6 @@ impl InteriorMethod {
     /// * `state[1]` - momentum desnity in kg/(m^2-s)
     /// * `state[2]` - energy density in J/m^3
     /// * `radius` - pipe radius in mm
-
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         kind: MethodKind,

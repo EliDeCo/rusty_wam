@@ -2,7 +2,7 @@
 // with the exception of the f and g functions which only give benefits in higher dimensions
 // https://doi.org/10.1016/S0021-9991(02)00037-2
 
-use crate::pipes::{InteriorSolver, PipeState};
+use crate::pipes::{BoundaryPair, InteriorSolver, PipeState};
 use nalgebra::{Matrix3, Matrix3x1, Matrix3xX};
 
 pub struct RoeM1D(PipeState);
@@ -22,18 +22,16 @@ impl InteriorSolver for RoeM1D {
     }
 
     ///Calculates the RoeM flux at every interface, then differences it into df.
-    fn residual(&mut self, q: &Matrix3xX<f64>) {
+    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair) {
         self.0.decode_from(q);
         self.0.euler_flux();
 
         //copy the scalars out first so the buffers below can be split-borrowed
         let gamma = self.0.gamma;
         let first = self.0.first;
-        let n_real = self.0.n_real;
         let PipeState {
             phi,
             f,
-            df,
             rho,
             u,
             p,
@@ -154,7 +152,6 @@ impl InteriorSolver for RoeM1D {
             );
         });
 
-        // Flux divergence per interior cell: phi_{i+1/2} - phi_{i-1/2}
-        phi.columns(1, n_real).sub_to(&phi.columns(0, n_real), df);
+        self.0.difference_flux(bc);
     }
 }
