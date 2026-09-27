@@ -1,36 +1,46 @@
 // This implimentation is based on P.S. Volpani's "07_1D_Euler_equations_Roe" example
 //https://github.com/psvolpiani/YouTube-CFD-101
 
-use crate::pipes::{BoundaryPair, InteriorSolver, PipeState};
+use crate::pipes::{BoundaryPair, CellFluxes, InteriorSolver, PipeState};
 use nalgebra::{Matrix3, Matrix3x1, Matrix3xX};
 
-pub struct Roe1D(PipeState);
+pub struct Roe1D {
+    shared: PipeState,
+    ///h and F(q) per cell, which only a non-reconstructing method has any use for
+    cells: CellFluxes,
+}
 
 impl Roe1D {
     pub(crate) fn new(state: PipeState) -> Self {
-        Self(state)
+        let cells = CellFluxes::new(state.n_total);
+
+        Self {
+            shared: state,
+            cells,
+        }
     }
 }
 
 impl InteriorSolver for Roe1D {
     fn state(&self) -> &PipeState {
-        &self.0
+        &self.shared
     }
     fn state_mut(&mut self) -> &mut PipeState {
-        &mut self.0
+        &mut self.shared
     }
 
     ///Calculates the Roe1D flux at every interface, then differences it into df.
-    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair) {
-        self.0.decode_from(q);
-        self.0.euler_flux();
+    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair, decoded: bool) {
+        if !decoded {
+            self.shared.decode_from(q);
+        }
+        self.cells.fill(q, &self.shared);
 
         //copy the scalars out first so the buffers below can be split-borrowed
-        let gamma = self.0.gamma;
-        let first = self.0.first;
-        let PipeState {
-            phi, f, rho, u, h, ..
-        } = &mut self.0;
+        let gamma = self.shared.gamma;
+        let first = self.shared.first;
+        let CellFluxes { h, f } = &self.cells;
+        let PipeState { phi, rho, u, .. } = &mut self.shared;
 
         //loop over each cell interface (column in phi)
         phi.column_iter_mut().enumerate().for_each(|(i, mut col)| {
@@ -104,6 +114,6 @@ impl InteriorSolver for Roe1D {
             col.copy_from(&(0.5 * (f.column(il) + f.column(ir)) - 0.5 * dissipation));
         });
 
-        self.0.difference_flux(bc);
+        self.shared.difference_flux(bc);
     }
 }

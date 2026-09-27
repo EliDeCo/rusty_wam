@@ -6,12 +6,16 @@ use std::collections::BTreeMap;
 
 ///Scratch buffers one pipe needs to be walked through the integrator's stages.
 struct Registers {
+    ///id of the pipe these belong to, which only a debug assertion reads
+    id: usize,
     qn: Matrix3xX<f64>,
     stages: Vec<Matrix3xX<f64>>,
 }
 
 ///The same buffers for a junction, which is a single cell of five values.
 struct JunctionRegisters {
+    ///id of the junction these belong to, which only a debug assertion reads
+    id: usize,
     qn: Vector5<f64>,
     stages: Vec<Vector5<f64>>,
 }
@@ -34,7 +38,10 @@ fn blend(
 ///What drives one pipe end, resolved once so no stage has to search for it.
 enum EndKind {
     Junction {
+        ///id of the junction, which is how the inlet this flux belongs to is reached
         junction: usize,
+        ///slot the same junction holds in the driver's register list
+        slot: usize,
         ///index of this pipe's entry in the junction's own inlet list
         inlet: usize,
         normal: Vector3<f64>,
@@ -44,6 +51,7 @@ enum EndKind {
 
 ///One pipe end whose ghosts the driver fills every stage.
 struct DrivenEnd {
+    ///slot the pipe holds in the register and boundary lists
     pipe: usize,
     ///whether this is the pipe's left end
     left: bool,
@@ -60,10 +68,12 @@ struct DrivenEnd {
 /// Registers live here rather than on the objects so a residual can borrow one freely.
 pub struct Driver {
     integrator: TimeIntegrator,
-    pipe_regs: BTreeMap<usize, Registers>,
-    junction_regs: BTreeMap<usize, JunctionRegisters>,
+    //held in the order the pipes and junctions iterate, which is fixed once Driver::new
+    //has run, so a stage indexes straight in rather than searching by id
+    pipe_regs: Vec<Registers>,
+    junction_regs: Vec<JunctionRegisters>,
     ///what each junction hands its branches, rebuilt every stage
-    bc: BTreeMap<usize, BoundaryPair>,
+    bc: Vec<BoundaryPair>,
     ends: Vec<DrivenEnd>,
 }
 
@@ -80,35 +90,25 @@ impl Driver {
             .iter()
             .map(|(&id, pipe)| {
                 let n_total = pipe.solver().state().n_total;
-                let stages = (0..n_regs).map(|_| Matrix3xX::zeros(n_total)).collect();
 
-                (
+                Registers {
                     id,
-                    Registers {
-                        qn: Matrix3xX::zeros(n_total),
-                        stages,
-                    },
-                )
+                    qn: Matrix3xX::zeros(n_total),
+                    stages: (0..n_regs).map(|_| Matrix3xX::zeros(n_total)).collect(),
+                }
             })
             .collect();
 
         let junction_regs = junctions
             .keys()
-            .map(|&id| {
-                (
-                    id,
-                    JunctionRegisters {
-                        qn: Vector5::zeros(),
-                        stages: vec![Vector5::zeros(); n_regs],
-                    },
-                )
+            .map(|&id| JunctionRegisters {
+                id,
+                qn: Vector5::zeros(),
+                stages: vec![Vector5::zeros(); n_regs],
             })
             .collect();
 
-        let bc = pipes
-            .keys()
-            .map(|&id| (id, BoundaryPair::default()))
-            .collect();
+        let bc = vec![BoundaryPair::default(); pipes.len()];
         let ends = resolve_ends(pipes, junctions);
 
         Self {
@@ -123,7 +123,7 @@ impl Driver {
     ///Rebuilds what each junction hands its branches for the stage about to run.
     /// Both sides of an interface take the same flux, which is what makes it conservative.
     fn refresh_boundary_data(&mut self, k: usize, junctions: &mut BTreeMap<usize, Junction>) {
-        for pair in self.bc.values_mut() {
+        for pair in self.bc.iter_mut() {
             *pair = BoundaryPair::default();
         }
 
@@ -136,7 +136,7 @@ impl Driver {
         } = self;
 
         for end in ends.iter() {
-            let p_regs = &pipe_regs[&end.pipe];
+            let p_regs = &pipe_regs[end.pipe];
             let p_state = if k == 0 {
                 &p_regs.qn
             } else {
@@ -151,10 +151,11 @@ impl Driver {
             let (ghost, flux) = match &end.kind {
                 EndKind::Junction {
                     junction,
+                    slot,
                     inlet,
                     normal,
                 } => {
-                    let j_regs = &junction_regs[junction];
+                    let j_regs = &junction_regs[*slot];
                     let j_state = if k == 0 {
                         j_regs.qn
                     } else {
@@ -188,13 +189,42 @@ impl Driver {
                 }
             };
 
-            let pair = bc.get_mut(&end.pipe).expect("pipe has no boundary data");
+            let pair = &mut bc[end.pipe];
             let side = match end.left {
                 true => &mut pair.left,
                 false => &mut pair.right,
             };
             side.ghost = Some(ghost);
             side.flux = flux;
+        }
+    }
+
+    ///Freezes the state the coming step starts from, resolves every boundary against it
+    /// and fills the ghosts, so `get_timestep` decodes what the first stage will read.
+    pub fn prepare(
+        &mut self,
+        pipes: &mut BTreeMap<usize, InteriorMethod>,
+        junctions: &mut BTreeMap<usize, Junction>,
+    ) {
+        //freeze q^n for everything before any stage runs
+        for (regs, (&id, pipe)) in self.pipe_regs.iter_mut().zip(pipes.iter()) {
+            debug_assert_eq!(regs.id, id, "pipe registers are out of order");
+            regs.qn.copy_from(&pipe.solver().state().q1);
+        }
+        for (regs, junction) in self.junction_regs.iter_mut().zip(junctions.values()) {
+            debug_assert_eq!(regs.id, junction.id, "junction registers are out of order");
+            regs.qn = junction.q1;
+        }
+
+        self.refresh_boundary_data(0, junctions);
+
+        //q1 gets the same ghosts as the register it was frozen into, which is what makes
+        //the decode behind get_timestep serve the first stage as well
+        let Self { pipe_regs, bc, .. } = self;
+        for ((regs, bc), pipe) in pipe_regs.iter_mut().zip(bc.iter()).zip(pipes.values_mut()) {
+            let n_ghost = pipe.solver().state().n_ghost;
+            apply_bc(&mut pipe.solver_mut().state_mut().q1, n_ghost, bc);
+            apply_bc(&mut regs.qn, n_ghost, bc);
         }
     }
 
@@ -208,23 +238,13 @@ impl Driver {
     ) {
         let stages = self.integrator.stages();
 
-        //freeze q^n for everything before any stage runs
-        for (id, pipe) in pipes.iter() {
-            let regs = self.pipe_regs.get_mut(id).expect("pipe has no registers");
-            regs.qn.copy_from(&pipe.solver().state().q1);
-        }
-        for (id, junction) in junctions.iter() {
-            let regs = self
-                .junction_regs
-                .get_mut(id)
-                .expect("junction has no registers");
-            regs.qn = junction.q1;
-        }
-
         for (k, &(a, b)) in stages.iter().enumerate() {
             let last = k + 1 == stages.len();
 
-            self.refresh_boundary_data(k, junctions);
+            //stage 0 reads what prepare resolved, so only later stages need refreshing
+            if k > 0 {
+                self.refresh_boundary_data(k, junctions);
+            }
             self.stage_junctions(k, last, a, b, dt, junctions);
             self.stage_pipes(k, last, a, b, dt, pipes);
         }
@@ -240,14 +260,15 @@ impl Driver {
         dt: f64,
         junctions: &mut BTreeMap<usize, Junction>,
     ) {
-        for (id, junction) in junctions.iter_mut() {
-            let regs = self
-                .junction_regs
-                .get_mut(id)
-                .expect("junction has no registers");
+        for (regs, junction) in self.junction_regs.iter_mut().zip(junctions.values_mut()) {
+            debug_assert_eq!(regs.id, junction.id, "junction registers are out of order");
 
-            //evaluate the residual at the state this stage starts from
+            //evaluate the residual at the state this stage starts from, which at stage 0
+            //is the state get_timestep already decoded
             let src = if k == 0 { regs.qn } else { regs.stages[k - 1] };
+            if k > 0 {
+                junction.decode_from(&src);
+            }
             junction.residual(&src);
 
             let next = blend(&regs.qn, &src, &junction.df, a, b, dt / junction.volume);
@@ -269,11 +290,8 @@ impl Driver {
         dt: f64,
         pipes: &mut BTreeMap<usize, InteriorMethod>,
     ) {
-        for (id, pipe) in pipes.iter_mut() {
-            //BoundaryPair is Copy, so take it before the registers are borrowed mutably
-            let bc = *self.bc.get(id).expect("pipe has no boundary data");
-            let regs = self.pipe_regs.get_mut(id).expect("pipe has no registers");
-
+        let Self { pipe_regs, bc, .. } = self;
+        for ((regs, bc), pipe) in pipe_regs.iter_mut().zip(bc.iter()).zip(pipes.values_mut()) {
             //copy the scalars out first so the buffers below can be split-borrowed
             let s = pipe.solver().state();
             let (first, n_real, n_ghost) = (s.first, s.n_real, s.n_ghost);
@@ -281,27 +299,25 @@ impl Driver {
 
             //the ghosts belong to the state this stage reads, so they are filled from the
             //boundary data that was just resolved against it
-            match k {
-                0 => apply_bc(&mut regs.qn, n_ghost, &bc),
-                _ => apply_bc(&mut regs.stages[k - 1], n_ghost, &bc),
+            if k > 0 {
+                apply_bc(&mut regs.stages[k - 1], n_ghost, bc);
             }
 
-            //evaluate the residual at the state this stage starts from
+            //evaluate the residual at the state this stage starts from, whose primitives
+            //stage 0 already has from get_timestep
             if k == 0 {
-                pipe.solver_mut().residual(&regs.qn, &bc);
+                pipe.solver_mut().residual(&regs.qn, bc, true);
             } else {
-                pipe.solver_mut().residual(&regs.stages[k - 1], &bc);
+                pipe.solver_mut().residual(&regs.stages[k - 1], bc, false);
             }
 
-            let Registers { qn, stages: bufs } = &mut *regs;
+            let Registers { qn, stages: bufs, .. } = &mut *regs;
 
             if last {
                 //last stage writes the answer straight into the pipe
                 let PipeState { q1, df, .. } = pipe.solver_mut().state_mut();
                 let src = if k == 0 { &*qn } else { &bufs[k - 1] };
                 rk_stage(q1, qn, src, df, a, b, c, first, n_real);
-                //so the stored state carries a boundary until the next step refreshes it
-                apply_bc(q1, n_ghost, &bc);
             } else {
                 let (done, rest) = bufs.split_at_mut(k);
                 let dst = &mut rest[0];
@@ -327,9 +343,16 @@ fn resolve_ends(
     pipes: &BTreeMap<usize, InteriorMethod>,
     junctions: &BTreeMap<usize, Junction>,
 ) -> Vec<DrivenEnd> {
+    //the slot each junction holds in the driver's register list, which is this map's order
+    let slots: BTreeMap<usize, usize> = junctions
+        .keys()
+        .enumerate()
+        .map(|(slot, &id)| (id, slot))
+        .collect();
+
     let mut ends = Vec::new();
 
-    for (&pipe, method) in pipes.iter() {
+    for (pipe_slot, (&pipe, method)) in pipes.iter().enumerate() {
         let s = method.solver().state();
 
         for (bc, left) in [(s.left_bc, true), (s.right_bc, false)] {
@@ -350,6 +373,7 @@ fn resolve_ends(
 
                     EndKind::Junction {
                         junction,
+                        slot: slots[&junction],
                         inlet: index,
                         normal: j.pipes[index].normal,
                     }
@@ -364,7 +388,7 @@ fn resolve_ends(
             };
 
             ends.push(DrivenEnd {
-                pipe,
+                pipe: pipe_slot,
                 left,
                 cell,
                 reference: Vector3::new(s.q1[(0, cell)], s.q1[(1, cell)], s.q1[(2, cell)]),

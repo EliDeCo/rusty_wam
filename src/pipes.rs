@@ -51,17 +51,12 @@ pub struct PipeState {
     pub(crate) rho: Matrix1xX<f64>,
     ///m/s
     pub(crate) u: Matrix1xX<f64>,
-    ///J/kg
-    pub(crate) e: Matrix1xX<f64>,
     ///Pa
     pub(crate) p: Matrix1xX<f64>,
-    ///J/kg
-    pub(crate) h: Matrix1xX<f64>,
     ///m/s
     pub(crate) a: Matrix1xX<f64>, //speed of sound, only needed for the CFL condition
 
     //flux workspace
-    pub(crate) f: Matrix3xX<f64>,   //physical (euler) flux, n_total
     pub(crate) phi: Matrix3xX<f64>, //numerical flux at each face, n_faces
     pub(crate) df: Matrix3xX<f64>,  //flux divergence per real cell, n_real
 
@@ -112,14 +107,11 @@ impl PipeState {
 
         Self {
             df: Matrix3xX::zeros(n_real),
-            f: Matrix3xX::zeros(n_total),
             a: placeholder.clone(),
             phi: Matrix3xX::zeros(n_faces),
             rho: placeholder.clone(),
             u: placeholder.clone(),
-            e: placeholder.clone(),
-            p: placeholder.clone(),
-            h: placeholder,
+            p: placeholder,
             q1,
             n_real,
             n_ghost,
@@ -142,13 +134,11 @@ impl PipeState {
             q1,
             rho,
             u,
-            e,
             p,
-            h,
             gamma,
             ..
         } = self;
-        decode_into(q1, rho, u, e, p, h, *gamma);
+        decode_into(q1, rho, u, p, *gamma);
     }
 
     ///Forces any supplied flux onto the two boundary faces, then differences phi into df.
@@ -172,39 +162,11 @@ impl PipeState {
         let Self {
             rho,
             u,
-            e,
             p,
-            h,
             gamma,
             ..
         } = self;
-        decode_into(q, rho, u, e, p, h, *gamma);
-    }
-
-    ///Calculates the Euler flux (F) for every cell from the decoded primitives.
-    /// q = [rho, rho*u, rho*E] where rho is the density, u is the velocity, and E is the total specific energy.
-    /// F = [rho*u, rho*u^2 + p, u*(rho*E + p)] where p is the pressure calculated from the equation of state.
-    pub(crate) fn euler_flux(&mut self) {
-        let Self {
-            rho,
-            u,
-            e,
-            p,
-            f,
-            n_total,
-            ..
-        } = self;
-
-        for i in 0..3 {
-            for j in 0..*n_total {
-                f[(i, j)] = match i {
-                    0 => rho[j] * u[j],                 // mass flux
-                    1 => rho[j] * u[j] * u[j] + p[j],   // momentum flux
-                    2 => u[j] * (rho[j] * e[j] + p[j]), // energy flux
-                    _ => panic!("Invalid index for flux calculation"),
-                }
-            }
-        }
+        decode_into(q, rho, u, p, *gamma);
     }
 
     ///Returns the minimum dt for this pipe.
@@ -266,6 +228,40 @@ impl PipeState {
     }
 }
 
+///Per-cell values only the first-order methods need, so a reconstructing method does not
+/// carry them. `h` is shared between the two faces of a cell, which is why it is a buffer.
+pub(crate) struct CellFluxes {
+    ///specific total enthalpy, J/kg
+    pub(crate) h: Matrix1xX<f64>,
+    ///physical (euler) flux, n_total
+    pub(crate) f: Matrix3xX<f64>,
+}
+
+impl CellFluxes {
+    pub(crate) fn new(n_total: usize) -> Self {
+        Self {
+            h: Matrix1xX::zeros(n_total),
+            f: Matrix3xX::zeros(n_total),
+        }
+    }
+
+    ///Fills both from the decoded primitives and the conserved energy row.
+    /// F = [rho*u, rho*u^2 + p, u*(rho*E + p)] and h = (rho*E + p)/rho.
+    pub(crate) fn fill(&mut self, q: &Matrix3xX<f64>, s: &PipeState) {
+        let Self { h, f } = self;
+
+        for j in 0..s.n_total {
+            let (rho, u, p) = (s.rho[j], s.u[j], s.p[j]);
+            let total = q[(2, j)] + p; // rho*E + p, the energy flux per unit velocity
+
+            h[j] = total / rho;
+            f[(0, j)] = rho * u; // mass flux
+            f[(1, j)] = rho * u * u + p; // momentum flux
+            f[(2, j)] = u * total; // energy flux
+        }
+    }
+}
+
 ///One interior method. Implementors supply only the spatial discretization;
 /// everything method-independent lives on PipeState.
 pub trait InteriorSolver {
@@ -275,7 +271,9 @@ pub trait InteriorSolver {
 
     ///Fills state.df with the raw flux difference phi[k+1] - phi[k] for the state q.
     /// The driver supplies the -(dt/dx) scaling, so every method writes df alike.
-    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair);
+    /// `decoded` says the primitive buffers already hold `q`, which the first stage of a
+    /// step gets from get_timestep, so a method that needs them can skip the work.
+    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair, decoded: bool);
 }
 
 ///Selects which interior method InteriorMethod::new constructs
@@ -458,30 +456,19 @@ fn decode_into(
     q: &Matrix3xX<f64>,
     rho: &mut Matrix1xX<f64>,
     u: &mut Matrix1xX<f64>,
-    e: &mut Matrix1xX<f64>,
     p: &mut Matrix1xX<f64>,
-    h: &mut Matrix1xX<f64>,
     gamma: f64,
 ) {
     rho.copy_from(&q.row(0));
     u.copy_from(&q.row(1)); //velocity
     u.component_div_assign(rho); // u = (rho*u)/rho, in place
 
-    e.copy_from(&q.row(2)); // specific total energy, NOT specific internal energy
-    e.component_div_assign(rho); // e = (rho*E)/rho, in place
-
-    // pressure from equation of state
+    // pressure straight off the conserved energy row, p = (γ-1)*(rho*E - 0.5*rho*u^2),
     //done step by step to avoid allocation
     p.copy_from(u);
     p.component_mul_assign(u); // p = u*u
-    *p *= -0.5; // p = -0.5*u*u
-    p.add_assign(&*e); // p = e - 0.5*u*u
-    p.component_mul_assign(rho); // p = rho*(e - 0.5*u*u)
-    *p *= gamma - 1.0; // p = (γ-1)*rho*(e - 0.5*u*u)
-
-    // specific total enthalpy
-    // computed in steps to avoid extra allocation
-    h.copy_from(p);
-    h.component_div_assign(rho); // h = p/rho
-    h.add_assign(&*e); // h = e + p/rho
+    p.component_mul_assign(rho); // p = rho*u*u
+    *p *= -0.5; // p = -0.5*rho*u*u
+    p.add_assign(&q.row(2)); // p = rho*E - 0.5*rho*u*u
+    *p *= gamma - 1.0; // p = (γ-1)*(rho*E - 0.5*rho*u*u)
 }

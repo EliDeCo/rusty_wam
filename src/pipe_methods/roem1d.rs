@@ -4,42 +4,48 @@
 // instability they exist to cure is a multi-dimensional one. See validation/RoeM1D.md
 // https://doi.org/10.1016/S0021-9991(02)00037-2
 
-use crate::pipes::{BoundaryPair, InteriorSolver, PipeState};
+use crate::pipes::{BoundaryPair, CellFluxes, InteriorSolver, PipeState};
 use nalgebra::{Matrix3, Matrix3x1, Matrix3xX};
 
-pub struct RoeM1D(PipeState);
+pub struct RoeM1D {
+    shared: PipeState,
+    ///h and F(q) per cell, which only a non-reconstructing method has any use for
+    cells: CellFluxes,
+}
 
 impl RoeM1D {
     pub(crate) fn new(state: PipeState) -> Self {
-        Self(state)
+        let cells = CellFluxes::new(state.n_total);
+
+        Self {
+            shared: state,
+            cells,
+        }
     }
 }
 
 impl InteriorSolver for RoeM1D {
     fn state(&self) -> &PipeState {
-        &self.0
+        &self.shared
     }
     fn state_mut(&mut self) -> &mut PipeState {
-        &mut self.0
+        &mut self.shared
     }
 
     ///Calculates the RoeM flux at every interface, then differences it into df.
-    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair) {
-        self.0.decode_from(q);
-        self.0.euler_flux();
+    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair, decoded: bool) {
+        if !decoded {
+            self.shared.decode_from(q);
+        }
+        self.cells.fill(q, &self.shared);
 
         //copy the scalars out first so the buffers below can be split-borrowed
-        let gamma = self.0.gamma;
-        let first = self.0.first;
+        let gamma = self.shared.gamma;
+        let first = self.shared.first;
+        let CellFluxes { h, f } = &self.cells;
         let PipeState {
-            phi,
-            f,
-            rho,
-            u,
-            p,
-            h,
-            ..
-        } = &mut self.0;
+            phi, rho, u, p, ..
+        } = &mut self.shared;
 
         //loop over each cell interface (column in phi)
         phi.column_iter_mut().enumerate().for_each(|(i, mut col)| {
@@ -153,6 +159,6 @@ impl InteriorSolver for RoeM1D {
             );
         });
 
-        self.0.difference_flux(bc);
+        self.shared.difference_flux(bc);
     }
 }

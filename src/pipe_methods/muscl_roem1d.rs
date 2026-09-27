@@ -19,10 +19,6 @@ const KAPPA: f64 = 1.0 / 3.0;
 /// each row's own acoustic scale. Measured, not fitted: see validation/MusclRoeM1D.md
 const R_SMOOTH: f64 = 1.0;
 
-const RECONSTRUCT_PRIMITIVE: bool = false;
-// false = reconstruct conserved (verified 3rd order);
-// true = reconstruct primitive (more robust, expect ~2nd order on nonlinear problems)
-
 ///Bundles everything `decode_state` + `euler_flux` produce, so the RoeM face loop can
 /// be called on either cell blocks or face blocks without a different function for each.
 /// All fields have the same width.
@@ -57,11 +53,6 @@ struct Workspace {
     q_r: Matrix3xX<f64>,   // n_faces
     wl: Decoded,           // n_faces - primitives/flux decoded from q_l
     wr: Decoded,           // n_faces - primitives/flux decoded from q_r
-
-    //primitives section
-    prim: Matrix3xX<f64>, // n_total -- only touched when RECONSTRUCT_PRIMITIVE
-    w_l: Matrix3xX<f64>,  // n_faces -- primitive-form face states, pre-conversion
-    w_r: Matrix3xX<f64>,  // n_faces
 }
 
 impl Workspace {
@@ -73,9 +64,6 @@ impl Workspace {
             q_r: Matrix3xX::zeros(n_faces),
             wl: Decoded::zeros(n_faces),
             wr: Decoded::zeros(n_faces),
-            prim: Matrix3xX::zeros(n_total),
-            w_l: Matrix3xX::zeros(n_faces),
-            w_r: Matrix3xX::zeros(n_faces),
         }
     }
 }
@@ -122,28 +110,17 @@ fn face_step(d_near: f64, d_far: f64, ref_step: f64) -> f64 {
 }
 
 ///Reference step the smoothness indicator measures a difference against, per cell and
-/// per row: R*dx times the row's acoustic size. Dividing by it is what makes a threshold
-/// of one mean the same thing in a row of kg/m3 and a row of J/m3. Conserved rows scale
-/// as (rho, rho a, rho a^2), primitive rows as (rho, a, rho a^2).
-fn fill_scales(
-    q: &Matrix3xX<f64>,
-    scale: &mut Matrix3xX<f64>,
-    dx: f64,
-    gamma: f64,
-    primitive: bool,
-) {
+/// per row: R*dx times the row's acoustic size, which for conserved rows is
+/// (rho, rho a, rho a^2). Dividing by it is what makes a threshold of one mean the same
+/// thing in a row of kg/m3 and a row of J/m3.
+fn fill_scales(q: &Matrix3xX<f64>, scale: &mut Matrix3xX<f64>, dx: f64, gamma: f64) {
     for col in 0..q.ncols() {
         let rho = q[(0, col)];
-        let p = if primitive {
-            q[(2, col)]
-        } else {
-            (gamma - 1.0) * (q[(2, col)] - 0.5 * q[(1, col)] * q[(1, col)] / rho)
-        };
+        let p = (gamma - 1.0) * (q[(2, col)] - 0.5 * q[(1, col)] * q[(1, col)] / rho);
         let a = (gamma * p / rho).sqrt();
-        let middle = if primitive { a } else { rho * a };
 
         scale[(0, col)] = R_SMOOTH * dx * rho;
-        scale[(1, col)] = R_SMOOTH * dx * middle;
+        scale[(1, col)] = R_SMOOTH * dx * (rho * a);
         scale[(2, col)] = R_SMOOTH * dx * rho * a * a;
     }
 }
@@ -232,34 +209,6 @@ fn reconstruct(
             q_l[(row, k)] = q[(row, left)] + face_step(mid, back, scale[(row, left)]);
             q_r[(row, k)] = q[(row, right)] - face_step(mid, fwd, scale[(row, right)]);
         }
-    }
-}
-
-///Converts an ENTIRE (3, W) block of conserved variables into primitives (rho, u, p).
-fn conserved_block_to_primitive(q: &Matrix3xX<f64>, w: &mut Matrix3xX<f64>, gamma: f64) {
-    for col in 0..q.ncols() {
-        let rho = q[(0, col)];
-        let u = q[(1, col)] / rho;
-        let e = q[(2, col)] / rho;
-        let p = (gamma - 1.0) * rho * (e - 0.5 * u * u);
-        w[(0, col)] = rho;
-        w[(1, col)] = u;
-        w[(2, col)] = p;
-    }
-}
-
-///Inverse of the above: primitive block -> conserved block. Needed because roe_flux
-/// (and the positivity check below) only ever want to see conserved variables --
-/// whichever variable set got reconstructed, q_l/q_r must come out in conserved form.
-fn primitive_block_to_conserved(w: &Matrix3xX<f64>, q: &mut Matrix3xX<f64>, gamma: f64) {
-    for col in 0..w.ncols() {
-        let rho = w[(0, col)];
-        let u = w[(1, col)];
-        let p = w[(2, col)];
-        let e = p / ((gamma - 1.0) * rho) + 0.5 * u * u;
-        q[(0, col)] = rho;
-        q[(1, col)] = rho * u;
-        q[(2, col)] = rho * e;
     }
 }
 
@@ -443,19 +392,10 @@ fn fill_phi(
     dx: f64,
     gamma: f64,
 ) {
-    if RECONSTRUCT_PRIMITIVE {
-        conserved_block_to_primitive(q, &mut ws.prim, gamma);
-        cell_differences(&ws.prim, &mut ws.dq);
-        fill_scales(&ws.prim, &mut ws.scale, dx, gamma, true);
-        reconstruct(&ws.prim, &ws.dq, &ws.scale, &mut ws.w_l, &mut ws.w_r, first);
-        primitive_block_to_conserved(&ws.w_l, &mut ws.q_l, gamma);
-        primitive_block_to_conserved(&ws.w_r, &mut ws.q_r, gamma);
-    } else {
-        cell_differences(q, &mut ws.dq); //calculates dq
-        fill_scales(q, &mut ws.scale, dx, gamma, false);
-        //reconstructs q_l and q_r, limited so smooth extrema keep third order
-        reconstruct(q, &ws.dq, &ws.scale, &mut ws.q_l, &mut ws.q_r, first);
-    }
+    cell_differences(q, &mut ws.dq); //calculates dq
+    fill_scales(q, &mut ws.scale, dx, gamma);
+    //reconstructs q_l and q_r, limited so smooth extrema keep third order
+    reconstruct(q, &ws.dq, &ws.scale, &mut ws.q_l, &mut ws.q_r, first);
 
     enforce_positivity(q, &mut ws.q_l, &mut ws.q_r, first, gamma); // last line of defense before the flux
 
@@ -485,7 +425,8 @@ impl InteriorSolver for MusclRoeM1D {
 
     ///One residual evaluation for the state q, in the shared df convention.
     /// Decodes its own face states, so it never touches the shared primitives.
-    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair) {
+    ///Reconstructs from `q` directly, so the decoded primitives are of no use here.
+    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair, _decoded: bool) {
         let (first, dx, gamma) = (self.shared.first, self.shared.dx, self.shared.gamma);
         let Self { shared, ws, .. } = self;
         fill_phi(q, ws, &mut shared.phi, first, dx, gamma);

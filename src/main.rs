@@ -1,5 +1,5 @@
-use nalgebra::{Matrix1xX, Matrix3xX, Vector3};
-use std::{collections::BTreeMap, env};
+use nalgebra::{Matrix3xX, Vector3};
+use std::{collections::BTreeMap, /*env*/};
 
 mod boundaries;
 mod driver;
@@ -39,133 +39,19 @@ enum RunMode {
     Steady { tol: f64, max_it: u32 },
 }
 
-///Largest residual magnitude held by each pipe and then each junction.
+///Writes the largest residual magnitude of each pipe and then each junction into `out`.
 /// Kept per object so a pipe's flux difference is never compared against a junction's.
 fn residuals(
     pipes: &BTreeMap<usize, InteriorMethod>,
     junctions: &BTreeMap<usize, Junction>,
-) -> Vec<f64> {
+    out: &mut [f64],
+) {
     let from_pipes = pipes.values().map(|pipe| pipe.solver().state().df.amax());
     let from_junctions = junctions.values().map(|junction| junction.df.amax());
 
-    from_pipes.chain(from_junctions).collect()
-}
-
-/// Left pressure = 1, right pressure = 0.1.
-/// Left density = 1, right density = 0.125.
-/// Velocity is 0 everywhere
-fn _sods_problem() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
-    println!("Configuration 1: Sod's problem.");
-
-    let mut rho0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let u0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let mut p0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let half = N_CELLS / 2;
-
-    //left
-    rho0.columns_mut(0, half).fill(1.0);
-    p0.columns_mut(0, half).fill(1.0);
-
-    //right
-    rho0.columns_mut(half, N_CELLS - half).fill(0.125);
-    p0.columns_mut(half, N_CELLS - half).fill(0.1);
-
-    (rho0, u0, p0)
-}
-
-// The following are tests from section 5.1 of the reference paper
-fn _shock_tube() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
-    println!("Configuration 1: Sod's problem.");
-
-    let mut rho0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let mut u0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let mut p0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let half = N_CELLS / 2;
-
-    //left
-    rho0.columns_mut(0, half).fill(3.0);
-    u0.columns_mut(0, half).fill(0.9);
-    p0.columns_mut(0, half).fill(3.0);
-
-    //right
-    rho0.columns_mut(half, N_CELLS - half).fill(1.0);
-    u0.columns_mut(half, N_CELLS - half).fill(0.9);
-    p0.columns_mut(half, N_CELLS - half).fill(1.0);
-
-    (rho0, u0, p0)
-}
-
-fn _contact_discontinuity() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
-    println!("Configuration 1: Sod's problem.");
-
-    let mut rho0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let mut u0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let mut p0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let half = N_CELLS / 2;
-
-    //left
-    rho0.columns_mut(0, half).fill(10.0);
-    u0.columns_mut(0, half).fill(0.1125);
-    p0.columns_mut(0, half).fill(1.0);
-
-    //right
-    rho0.columns_mut(half, N_CELLS - half).fill(0.125);
-    u0.columns_mut(half, N_CELLS - half).fill(0.1125);
-    p0.columns_mut(half, N_CELLS - half).fill(1.0);
-
-    (rho0, u0, p0)
-}
-
-fn _supersonic_expansion_test() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
-    println!("Configuration 1: Sod's problem.");
-
-    let mut rho0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let mut u0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let mut p0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let half = N_CELLS / 2;
-
-    //left
-    rho0.columns_mut(0, half).fill(1.0);
-    u0.columns_mut(0, half).fill(-2.0);
-    p0.columns_mut(0, half).fill(3.0);
-
-    //right
-    rho0.columns_mut(half, N_CELLS - half).fill(1.0);
-    u0.columns_mut(half, N_CELLS - half).fill(2.0);
-    p0.columns_mut(half, N_CELLS - half).fill(3.0);
-
-    (rho0, u0, p0)
-}
-
-///Custom test to confirm MUSCL + Limiter functionality
-/// Pulse should stay thin and sharp and remain the same shape and size for the entire simulation.
-/// Basic RoeM smears this horizontally, and the conservation of area under the curve causes
-/// height to decrease as well. This is INCORRECT behavior
-pub fn density_pulse_test() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
-    println!("Configuration: density pulse advection test.");
-
-    let mut rho0: Matrix1xX<f64> = Matrix1xX::from_element(N_CELLS, 1.0); // rho_bg
-    let u0: Matrix1xX<f64> = Matrix1xX::from_element(N_CELLS, 0.5);
-    let p0: Matrix1xX<f64> = Matrix1xX::from_element(N_CELLS, 1.0);
-
-    // top-hat: 2% of domain, starting near the inlet
-    let pulse_start = (0.3 * N_CELLS as f64) as usize;
-    let pulse_end = (0.32 * N_CELLS as f64) as usize;
-    rho0.columns_mut(pulse_start, pulse_end - pulse_start)
-        .fill(2.0);
-
-    (rho0, u0, p0)
-}
-
-/// At rest
-pub fn at_rest() -> (Matrix1xX<f64>, Matrix1xX<f64>, Matrix1xX<f64>) {
-    println!("Pipe at rest.");
-
-    let rho0: Matrix1xX<f64> = Matrix1xX::from_element(N_CELLS, 1.0);
-    let u0: Matrix1xX<f64> = Matrix1xX::zeros(N_CELLS);
-    let p0: Matrix1xX<f64> = Matrix1xX::from_element(N_CELLS, 1.0);
-
-    (rho0, u0, p0)
+    for (slot, residual) in out.iter_mut().zip(from_pipes.chain(from_junctions)) {
+        *slot = residual;
+    }
 }
 
 ///Which pipe ends attach to which junctions, as a straight-through pair along x.
@@ -190,9 +76,11 @@ fn topology() -> Vec<Link> {
 }
 
 fn main() {
+    /* 
     unsafe {
         env::set_var("RUST_BACKTRACE", "full");
     }
+    */
 
     let mut pipes: BTreeMap<usize, InteriorMethod> = BTreeMap::new();
     let mut junctions: BTreeMap<usize, Junction> = BTreeMap::new();
@@ -207,8 +95,8 @@ fn main() {
 
     for id in 0..N_PIPES {
         let (rho0, u0, p0) = match id {
-            0 => density_pulse_test(),
-            _ => at_rest(),
+            0 => density_pulse_test(N_CELLS),
+            _ => at_rest(N_CELLS),
         };
 
         //initial total energy
@@ -262,14 +150,16 @@ fn main() {
         junction.initialize(&pipes);
     }
 
-    let chart = ChartDetails {
+    let mut chart = ChartDetails {
         width: 50,
         height: 50,
         x_min: 0.0,
         x_max: 1.0,
         y_min: 0.0,
         y_max: 2.0,
-        x: (0..N_CELLS).map(|j| (j as f64 + 0.5) * DX).collect(),
+        points: (0..N_CELLS)
+            .map(|j| (((j as f64 + 0.5) * DX) as f32, 0.0))
+            .collect(),
     };
 
     let mut driver = Driver::new(RK_ORDER, &pipes, &junctions);
@@ -278,9 +168,16 @@ fn main() {
 
     //a steady run has no end time to land on, so it never clips the last step
     let steady = matches!(RUN_MODE, RunMode::Steady { .. });
-    let mut peak: Vec<f64> = Vec::new();
+
+    //one residual per pipe and junction, sized here so the loop itself never allocates
+    let mut now: Vec<f64> = vec![0.0; pipes.len() + junctions.len()];
+    let mut peak: Vec<f64> = now.clone();
 
     loop {
+        //resolves the boundaries and fills the ghosts of the state the step starts from,
+        //which the timestep below then decodes once for the whole step
+        driver.prepare(&mut pipes, &mut junctions);
+
         dt = pipes
             .values_mut()
             .fold(f64::INFINITY, |dt, pipe| dt.min(pipe.get_timestep()))
@@ -299,12 +196,11 @@ fn main() {
 
             //temp display
             if it % 200 == 0 {
-                plot(pipe.rho(), it, pipe.id(), &chart);
+                plot(pipe.rho(), it, pipe.id(), &mut chart);
             }
         }
 
-        for junction in junctions.values_mut() {
-            junction.decode();
+        for junction in junctions.values() {
             junction.unreal_check();
         }
 
@@ -321,10 +217,7 @@ fn main() {
                 }
             }
             RunMode::Steady { tol, max_it } => {
-                let now = residuals(&pipes, &junctions);
-                if peak.is_empty() {
-                    peak = now.clone();
-                }
+                residuals(&pipes, &junctions, &mut now);
 
                 //residuals climb before they fall, so convergence is measured against the
                 //worst each object has reached rather than whatever the first step gave

@@ -3,7 +3,7 @@
 
 use crate::helpers::unphysical;
 use crate::pipes::InteriorMethod;
-use nalgebra::{Matrix3xX, Vector3, Vector5};
+use nalgebra::{Vector3, Vector5};
 use std::collections::BTreeMap;
 
 pub struct Junction {
@@ -40,29 +40,12 @@ pub struct Junction {
 impl Junction {
     ///Decodes the junction's own current state into primitives.
     pub fn decode(&mut self) {
-        self.decode_from(&self.q1.clone());
+        (self.rho, self.u, self.p, self.h) = decode5(&self.q1, self.gamma);
     }
 
     ///Decodes a conservative state into density, velocity, pressure and enthalpy.
     pub fn decode_from(&mut self, q: &Vector5<f64>) {
-        self.rho = q[0];
-
-        let without_rho = q / self.rho;
-
-        // u = (rho*u)/rho,
-        self.u = without_rho.fixed_rows::<3>(1).into_owned();
-
-        // specific total energy, NOT specific internal energy
-        // e = (rho*E)/rho
-        let e = without_rho[4];
-
-        // pressure from equation of state
-        // p = (γ-1)*rho*(e - 0.5*(u_x^2 + u_y^2 + u_z^2))
-        self.p = (self.gamma - 1.0) * self.rho * (e - 0.5 * self.u.dot(&self.u));
-
-        // specific total enthalpy
-        // h = e + p/rho
-        self.h = e + self.p / self.rho;
+        (self.rho, self.u, self.p, self.h) = decode5(q, self.gamma);
     }
     ///Checks for a density or pressure that is not physically usable, which indicates
     /// a numerical blowup.
@@ -91,9 +74,9 @@ impl Junction {
     }
 
     ///Fills df with the outward interface flux sum plus the representative wall force.
-    /// The driver stores each interface flux before this runs.
+    /// The driver stores each interface flux and decodes `q` before this runs.
     pub fn residual(&mut self, q: &Vector5<f64>) {
-        self.decode_from(q);
+        debug_assert_eq!(self.rho, q[0], "junction {}: q is not decoded", self.id);
 
         self.df = self
             .pipes
@@ -151,20 +134,16 @@ impl Junction {
             self.id
         );
 
-        let n_pipes = self.pipes.len();
-        let mut volumes: Vec<f64> = Vec::with_capacity(n_pipes);
-        let mut states: Matrix3xX<f64> = Matrix3xX::zeros(n_pipes);
-        let mut velocities: Vec<Vector3<f64>> = Vec::with_capacity(n_pipes);
-        let mut pressures: Vec<f64> = Vec::with_capacity(n_pipes);
-        let mut areas: Vec<f64> = Vec::with_capacity(n_pipes);
+        //every average below is sum(value * weight) / sum(weight), so both halves add up
+        //in the one pass over the branches and nothing is stored per pipe
+        let mut total_vol = 0.0;
+        let mut rho_vol = 0.0;
+        let mut p_vol = 0.0;
+        let mut total_surface_area = 0.0;
+        let mut vel_area: Vector3<f64> = Vector3::zeros();
 
-        //gather pipe data
-        for (i, inlet) in self.pipes.iter().enumerate() {
-            let pipe = &all_pipes[&inlet.pipe_id];
-            let pipe_state = pipe.solver().state();
-
-            //add the volume of a cell from this pipe
-            volumes.push(pipe_state.cell_volume());
+        for inlet in self.pipes.iter() {
+            let pipe_state = all_pipes[&inlet.pipe_id].solver().state();
 
             //index of the real cell adjacent to this junction, in the PADDED array -
             //the ghosts shift it over by `first`. Normals point out of the junction,
@@ -175,23 +154,24 @@ impl Junction {
                 false => (pipe_state.first + pipe_state.n_real - 1, -1.),
             };
 
-            //add the initial condition of the adjacent cell from this pipe
-            states.column_mut(i).copy_from(&pipe_state.q1.column(index));
-
-            //velocity is read straight back out of that state, so this does not
+            //read straight out of the adjacent cell's initial condition, so this does not
             //depend on the pipe having been decoded yet
-            let u = states[(1, i)] / states[(0, i)];
+            let q = pipe_state.q1.column(index);
+            let rho = q[0];
+            let u = q[1] / rho;
+            let p = (self.gamma - 1.0) * (q[2] - 0.5 * rho * u * u);
 
-            //add velocity vector in normal direction scaled by pipe's velocity
-            velocities.push(inlet.normal * u * multiplier);
-            pressures.push((self.gamma - 1.0) * (states[(2, i)] - 0.5 * states[(0, i)] * u * u));
-            areas.push(inlet.area);
+            //a cell's volume weights its density and pressure, its opening weights velocity
+            let volume = pipe_state.cell_volume();
+            total_vol += volume;
+            rho_vol += rho * volume;
+            p_vol += p * volume;
+            total_surface_area += inlet.area;
+            vel_area += inlet.normal * u * multiplier * inlet.area;
         }
 
-        let total_vol = volumes.iter().sum::<f64>();
-
         //set volume to mean of adjacent cell volumes
-        self.volume = total_vol / volumes.len() as f64;
+        self.volume = total_vol / self.pipes.len() as f64;
 
         //fixed geometry, so the wall force only has to scale it by pressure each step
         self.normal_area_sum = self
@@ -199,24 +179,10 @@ impl Junction {
             .iter()
             .fold(Vector3::zeros(), |sum, pipe| sum + pipe.normal * pipe.area);
 
-        //set mass density and pressure by weighted average
-        let mean = |vals: &[f64]| {
-            volumes
-                .iter()
-                .zip(vals)
-                .fold(0.0, |sum, (weight, val)| sum + val * weight)
-                / total_vol
-        };
-        let rho_mean = mean(states.row(0).clone_owned().as_slice());
-        let p_mean = mean(&pressures);
-
-        //set velocity as a weighted average of vectors by pipe inlet surface area
-        let total_surface_area = areas.iter().sum::<f64>();
-        let u_mean = velocities
-            .iter()
-            .zip(areas)
-            .fold(Vector3::zeros(), |sum, (val, weight)| sum + val * weight)
-            / total_surface_area;
+        //mass density and pressure by volume-weighted average, velocity by area
+        let rho_mean = rho_vol / total_vol;
+        let p_mean = p_vol / total_vol;
+        let u_mean = vel_area / total_surface_area;
 
         //energy is rebuilt from that pressure and velocity rather than averaged straight
         //from the branches, which would leave the junction holding more heat than they do
