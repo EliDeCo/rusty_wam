@@ -46,6 +46,36 @@ instead gives orders of 2.37, 2.24, 2.14 and 2.07, converging on two rather than
 That is their Pitfall 8 and 9 reproduced: a finite volume scheme compared against point
 values reads second order however correct it is.
 
+## Order on the Euler equations
+
+The table above grades the reconstruction through a scalar Burgers harness. This one grades the
+whole shipped path — `Driver`, the RoeM flux, the reconstruction and `Ssp3` together — on a
+problem that is smooth and exactly solvable.
+
+A pure contact wave: air at 101325 Pa and 1.225 kg/m3 with uniform velocity 100 m/s and
+uniform pressure, carrying a Gaussian density bump of 10 per cent amplitude and
+`sigma = 0.08 m`, on a 1 m pipe with both ends non-reflecting. Every term of the Euler
+equations cancels except `rho_t + u rho_x = 0`, so `rho(x,t) = rho_0(x - u t)` holds exactly
+for all time while `u` and `p` stay constant. The pulse is advected 0.3 m, which keeps four
+sigma of clearance at both ends so no wave ever reaches a boundary. Courant 0.5, graded in L1
+against the cell-averaged exact solution and reported relative to the perturbation amplitude.
+
+| Cells | L1 error | Observed order |
+|---|---|---|
+| 100 | 9.3723e-4 | - |
+| 200 | 1.2060e-4 | 2.96 |
+| 400 | 1.5140e-5 | 2.99 |
+| 800 | 1.8961e-6 | 3.00 |
+| 1600 | 2.3842e-7 | 2.99 |
+
+Third order on the system, not only on the scalar case. The max norm over the same runs fits
+2.98, so unlike the second order variant this scheme loses nothing at the extremum, which is
+what the smoothness indicator is for.
+
+Velocity and pressure hold their initial values to 2e-9 and 8e-10 relative on every grid, so the
+wave stays the pure contact the exact solution assumes. That is the contact preservation the
+RoeM flux exists for, measured end to end rather than off the flux function.
+
 ## Against the limiter's defining identities
 
 Taken off the shipped reconstruction, by handing it a four-cell stencil whose difference

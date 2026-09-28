@@ -45,6 +45,42 @@ variant exists precisely to avoid this, which is what its smoothness indicator b
 `phi-hat alone` column of `Muscl3RoeM1D.md` shows the same collapse when that indicator is
 switched off.
 
+## Order on the Euler equations
+
+The table above grades the reconstruction through a scalar Burgers harness. This one grades the
+whole shipped path — `Driver`, the RoeM flux, the reconstruction and `Ssp2` together — on a
+problem that is smooth and exactly solvable.
+
+A pure contact wave: air at 101325 Pa and 1.225 kg/m3 with uniform velocity 100 m/s and
+uniform pressure, carrying a Gaussian density bump of 10 per cent amplitude and
+`sigma = 0.08 m`, on a 1 m pipe with both ends non-reflecting. Every term of the Euler
+equations cancels except `rho_t + u rho_x = 0`, so `rho(x,t) = rho_0(x - u t)` holds exactly
+for all time while `u` and `p` stay constant. The pulse is advected 0.3 m, which keeps four
+sigma of clearance at both ends so no wave ever reaches a boundary. Courant 0.5, graded in L1
+against the cell-averaged exact solution and reported relative to the perturbation amplitude.
+
+| Cells | L1 error | Observed order |
+|---|---|---|
+| 100 | 3.3001e-3 | - |
+| 200 | 9.9941e-4 | 1.72 |
+| 400 | 2.7604e-4 | 1.86 |
+| 800 | 7.1766e-5 | 1.94 |
+| 1600 | 1.8303e-5 | 1.97 |
+
+The order climbs to two here rather than sitting on it from the first grid, which is what the
+Burgers L1 column does. The difference is how much of the profile the extremum occupies: at 100
+cells the Gaussian is only eight cells per sigma, so the clipped peak is a large share of it, and
+that share falls under refinement. By 1600 cells the reading is 1.97.
+
+The same runs fit 1.24 in the max norm, because that norm sits on the clipped extremum and
+reports its order alone. It is the same effect the Burgers table shows, on a different problem,
+and L1 is the column that shows the design order either way.
+
+Velocity and pressure drift from their initial values by 2.2e-5 and 1.3e-5 relative at 100 cells,
+falling to 5.8e-8 and 2.2e-8 by 1600. `Muscl3RoeM1D` holds both near 2e-9 throughout, so this
+reconstruction generates four orders more spurious acoustics on a contact than that one does.
+Both are far too small to affect the table above, but only one of them is preserving the contact.
+
 ## The limiter against the properties a TVD limiter must have
 
 Taken off the shipped `limited_slope` by handing it a near difference of one and a far
