@@ -20,7 +20,8 @@ Every implimented method is validated against all the tests in the paper it was 
 | 800 | 1.8961e-6 | 3.00 |
 | 1600 | 2.3842e-7 | 2.99 |
 
-![Sod's Problem 3rd order Muscl + RoeM](validation\Sods.png)
+![Sod's Problem 3rd order Muscl + RoeM](validation/Sods.png)
+
 
 ## Planned Features:
 Pipe Solver
