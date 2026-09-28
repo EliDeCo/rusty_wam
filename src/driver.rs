@@ -20,19 +20,21 @@ struct JunctionRegisters {
     stages: Vec<Vector5<f64>>,
 }
 
-///One integrator stage for a junction cell: dst = a*q_n + b*(src + dt*R).
+///One integrator stage for a junction cell: dst = a*q_n + b*src - c*dt/vol*df.
 /// The junction is a control volume, so its scaling is dt/volume rather than dt/dx.
+#[allow(clippy::too_many_arguments)]
 fn blend(
     q_n: &Vector5<f64>,
     src: &Vector5<f64>,
     df: &Vector5<f64>,
     a: f64,
     b: f64,
+    c: f64,
     dt_over_vol: f64,
 ) -> Vector5<f64> {
     debug_assert!((a + b - 1.0).abs() < 1e-15, "stage weights must sum to 1");
 
-    a * q_n + b * (src - dt_over_vol * df)
+    a * q_n + b * src - (c * dt_over_vol) * df
 }
 
 ///What drives one pipe end, resolved once so no stage has to search for it.
@@ -84,6 +86,16 @@ impl Driver {
         pipes: &BTreeMap<usize, InteriorMethod>,
         junctions: &BTreeMap<usize, Junction>,
     ) -> Self {
+        //forward Euler is unstable with a reconstructing method at every Courant number, and
+        //fails thousands of steps in rather than at once: validation/MusclRoeM1D.md
+        assert!(
+            !(matches!(integrator, TimeIntegrator::Euler)
+                && pipes
+                    .values()
+                    .any(|p| matches!(p, InteriorMethod::MusclRoeM1D(_)))),
+            "MusclRoeM1D is unstable with Euler at every Courant number; use Ssp2 or higher"
+        );
+
         let n_regs = integrator.n_registers();
 
         let pipe_regs = pipes
@@ -238,25 +250,27 @@ impl Driver {
     ) {
         let stages = self.integrator.stages();
 
-        for (k, &(a, b)) in stages.iter().enumerate() {
+        for (k, &(a, b, c)) in stages.iter().enumerate() {
             let last = k + 1 == stages.len();
 
             //stage 0 reads what prepare resolved, so only later stages need refreshing
             if k > 0 {
                 self.refresh_boundary_data(k, junctions);
             }
-            self.stage_junctions(k, last, a, b, dt, junctions);
-            self.stage_pipes(k, last, a, b, dt, pipes);
+            self.stage_junctions(k, last, a, b, c, dt, junctions);
+            self.stage_pipes(k, last, a, b, c, dt, pipes);
         }
     }
 
     ///Runs one stage for every junction.
+    #[allow(clippy::too_many_arguments)]
     fn stage_junctions(
         &mut self,
         k: usize,
         last: bool,
         a: f64,
         b: f64,
+        c: f64,
         dt: f64,
         junctions: &mut BTreeMap<usize, Junction>,
     ) {
@@ -271,7 +285,7 @@ impl Driver {
             }
             junction.residual(&src);
 
-            let next = blend(&regs.qn, &src, &junction.df, a, b, dt / junction.volume);
+            let next = blend(&regs.qn, &src, &junction.df, a, b, c, dt / junction.volume);
             if last {
                 junction.q1 = next;
             } else {
@@ -281,12 +295,14 @@ impl Driver {
     }
 
     ///Runs one stage for every pipe.
+    #[allow(clippy::too_many_arguments)]
     fn stage_pipes(
         &mut self,
         k: usize,
         last: bool,
         a: f64,
         b: f64,
+        c: f64,
         dt: f64,
         pipes: &mut BTreeMap<usize, InteriorMethod>,
     ) {
@@ -295,7 +311,7 @@ impl Driver {
             //copy the scalars out first so the buffers below can be split-borrowed
             let s = pipe.solver().state();
             let (first, n_real, n_ghost) = (s.first, s.n_real, s.n_ghost);
-            let c = dt / s.dx;
+            let dt_over_dx = dt / s.dx;
 
             //the ghosts belong to the state this stage reads, so they are filled from the
             //boundary data that was just resolved against it
@@ -311,13 +327,15 @@ impl Driver {
                 pipe.solver_mut().residual(&regs.stages[k - 1], bc, false);
             }
 
-            let Registers { qn, stages: bufs, .. } = &mut *regs;
+            let Registers {
+                qn, stages: bufs, ..
+            } = &mut *regs;
 
             if last {
                 //last stage writes the answer straight into the pipe
                 let PipeState { q1, df, .. } = pipe.solver_mut().state_mut();
                 let src = if k == 0 { &*qn } else { &bufs[k - 1] };
-                rk_stage(q1, qn, src, df, a, b, c, first, n_real);
+                rk_stage(q1, qn, src, df, a, b, c, dt_over_dx, first, n_real);
             } else {
                 let (done, rest) = bufs.split_at_mut(k);
                 let dst = &mut rest[0];
@@ -330,6 +348,7 @@ impl Driver {
                     a,
                     b,
                     c,
+                    dt_over_dx,
                     first,
                     n_real,
                 );

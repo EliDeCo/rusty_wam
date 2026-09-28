@@ -43,9 +43,7 @@ impl InteriorSolver for RoeM1D {
         let gamma = self.shared.gamma;
         let first = self.shared.first;
         let CellFluxes { h, f } = &self.cells;
-        let PipeState {
-            phi, rho, u, p, ..
-        } = &mut self.shared;
+        let PipeState { phi, rho, u, p, .. } = &mut self.shared;
 
         //loop over each cell interface (column in phi)
         phi.column_iter_mut().enumerate().for_each(|(i, mut col)| {

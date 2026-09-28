@@ -1,5 +1,5 @@
 use nalgebra::{Matrix3xX, Vector3};
-use std::{collections::BTreeMap, /*env*/};
+use std::{collections::BTreeMap /*env*/};
 
 mod boundaries;
 mod driver;
@@ -76,7 +76,7 @@ fn topology() -> Vec<Link> {
 }
 
 fn main() {
-    /* 
+    /*
     unsafe {
         env::set_var("RUST_BACKTRACE", "full");
     }

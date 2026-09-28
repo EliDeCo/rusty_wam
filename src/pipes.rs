@@ -160,11 +160,7 @@ impl PipeState {
     ///Decodes an externally held state into the shared primitive buffers.
     pub(crate) fn decode_from(&mut self, q: &Matrix3xX<f64>) {
         let Self {
-            rho,
-            u,
-            p,
-            gamma,
-            ..
+            rho, u, p, gamma, ..
         } = self;
         decode_into(q, rho, u, p, *gamma);
     }
@@ -305,15 +301,29 @@ pub enum TimeIntegrator {
     Euler,
     Ssp2,
     Ssp3,
+    Ssp43,
 }
 
 impl TimeIntegrator {
-    ///Blend weights (a, b) for each stage in turn, where a + b is always 1.
-    pub(crate) fn stages(&self) -> &'static [(f64, f64)] {
+    ///Blend weights (a, b, c) for each stage in turn, where a + b is always 1.
+    /// Ssp43 weights its dt term by c rather than b, which is why c is carried separately.
+    pub(crate) fn stages(&self) -> &'static [(f64, f64, f64)] {
         match self {
-            TimeIntegrator::Euler => &[(0.0, 1.0)],
-            TimeIntegrator::Ssp2 => &[(0.0, 1.0), (0.5, 0.5)],
-            TimeIntegrator::Ssp3 => &[(0.0, 1.0), (0.75, 0.25), (1.0 / 3.0, 2.0 / 3.0)],
+            TimeIntegrator::Euler => &[(0.0, 1.0, 1.0)],
+            TimeIntegrator::Ssp2 => &[(0.0, 1.0, 1.0), (0.5, 0.5, 0.5)],
+            TimeIntegrator::Ssp3 => &[
+                (0.0, 1.0, 1.0),
+                (0.75, 0.25, 0.25),
+                (1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0),
+            ],
+            //Kraaijevanger's four stage third order scheme, whose stability polynomial
+            //(2a + a^4)/3 with a = 1 + z/2 is Cada & Torrilhon's Eq 6.7
+            TimeIntegrator::Ssp43 => &[
+                (0.0, 1.0, 0.5),
+                (0.0, 1.0, 0.5),
+                (2.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0),
+                (0.0, 1.0, 0.5),
+            ],
         }
     }
 
@@ -323,7 +333,7 @@ impl TimeIntegrator {
     }
 }
 
-///One integrator stage in place: dst = a*q_n + b*(src + dt*R), where R = -df/dx.
+///One integrator stage in place: dst = a*q_n + b*src - c*dt/dx*df.
 /// Doing the blend in place keeps the time loop allocation free.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rk_stage(
@@ -333,21 +343,25 @@ pub(crate) fn rk_stage(
     df: &Matrix3xX<f64>,
     a: f64,
     b: f64,
+    c: f64,
     dt_over_dx: f64,
     first: usize,
     n_real: usize,
 ) {
     debug_assert!((a + b - 1.0).abs() < 1e-15, "stage weights must sum to 1");
 
+    let k = c * dt_over_dx;
     let mut d = dst.columns_mut(first, n_real);
 
-    // d = src + dt*R
+    // d = b*src - c*dt/dx*df
     d.copy_from(&src.columns(first, n_real));
-    d.zip_apply(df, |x, dfv| *x -= dt_over_dx * dfv);
-
-    // d = a*q_n + b*d   (stage 1 is a=0, b=1, so skip the blend entirely)
-    if a != 0.0 {
+    if b != 1.0 {
         d *= b;
+    }
+    d.zip_apply(df, |x, dfv| *x -= k * dfv);
+
+    // d += a*q_n   (a first stage is always a=0, so it skips the blend entirely)
+    if a != 0.0 {
         d.zip_apply(&q_n.columns(first, n_real), |x, qn| *x += a * qn);
     }
 }

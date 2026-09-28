@@ -9,7 +9,8 @@ Nishikawa's Eq 22, limited by Cada and Torrilhon's Eq 4.41, around the RoeM flux
 `RoeM1D.md`. Order is graded on their Section 4.2 Burgers case, which is the one test in
 either paper whose time integrator is the solver's own. Monotonicity is graded on Sod's
 classical initial data, and the radius of the smoothness indicator on air at 101325 Pa and
-1.225 kg/m3. Gamma is 1.4 throughout.
+1.225 kg/m3. The Courant number is graded against their Section 6.1 von Neumann analysis,
+which `TimeIntegrator::Ssp43` was added to reach. Gamma is 1.4 throughout.
 
 ## Order of accuracy
 
@@ -104,6 +105,115 @@ extrema. Small overshoots are therefore expected rather than excluded, and what 
 Section 7.3 claims for them is that they diminish under refinement. Both columns do,
 monotonically, with the worst density excursion below 0.16 per cent at every resolution.
 
+## Courant number
+
+Their Section 6.1: the semi-discrete symbol of the reconstruction in closed form, and the
+Courant numbers at which each integrator stays stable on it. Linear advection
+`u_t + u_x = 0`, Fourier mode `exp(i j k)`, advanced one step by `R(L(nu,k))` where `L` is
+the symbol of Eq 6.21 and `R` the stability polynomial of Eq 6.5 to 6.7. Stability is
+`max|R| <= 1` over 4000 wavenumbers in `(0, pi]`, bisected on `nu` to 1e-12. `Ssp3` is
+their three-stage SSP33 and `Ssp2` their Heun. What these limits are worth in compute time,
+and which Courant number to actually run, is in `time_efficiency.md`.
+
+| Reconstruction | Scheme | Ours | Theirs | Source |
+|---|---|---|---|---|
+| kappa = 1/3, as shipped | Ssp3 | 1.626 | 1.63 | Fig 6.2 left |
+| kappa = 1/3, as shipped | Ssp43 | 2.037 | 2.04 | Fig 6.2 right |
+| kappa = 1/3, as shipped | Ssp2 | 0.874 | 0.83 | Section 6.1 |
+| kappa = 1/3, as shipped | Euler | unstable at every nu | not given | - |
+| kappa = 0 | Ssp2 | 1.000 | 1.0 | Fig 6.1 |
+| phi = theta | Ssp2 | 0.500 | 0.5 | Fig 6.3 |
+| phi = theta | Ssp3 | 0.628 | 0.63 | Fig 6.3 |
+| phi = 2 theta | Ssp2, Ssp3 | unstable at every nu | absolutely unstable | Section 6.1 |
+
+The last four rows are the controls. They are quoted for reconstructions this solver does
+not use, and two of them land on exact round numbers, which is what establishes the symbol
+is implemented correctly before the kappa = 1/3 rows are trusted. The Ssp43 row matches the
+2.04 printed inside their Fig 6.2 rather than the "about 2.0" of its caption.
+
+First-order upwind is not in their analysis and is added here because it is what `RoeM1D`
+and `Roe1D` reduce to on this problem, which the solver table below is graded against:
+1.000 with `Euler`, 1.000 with `Ssp2`, 1.256 with `Ssp3`, 2.000 with `Ssp43`.
+
+The `Ssp2` row is the one that misses, 0.874 against 0.83, and the reason is that the
+boundary there is soft rather than sharp. `max|R|` is 1.000000000 at `nu = 0.87` and only
+1.000157 at `nu = 0.9`, so where the limit is declared depends on the tolerance chosen.
+Both numbers describe the same curve.
+
+### Accumulated error against Courant number
+
+Their Eq 6.29 gives the per-step amplification error as `1 - (1/24) nu (2 + nu^3) k^4` for
+`Ssp3` and `1 - (1/48) nu (4 + nu^3) k^4` for `Ssp43`. Over a fixed end time the step count
+is `T/(nu dx)`, so the accumulated error carries `(2 + nu^3)` and `(4 + nu^3)/2`
+respectively. Graded on linear advection, which is the problem Eq 6.29 was derived for:
+`u(x,0) = sin(2 pi x)` on `[0,1]`, periodic, to `t = 2`, two full periods, max norm against
+the exact cell average, each row normalised by its own `nu = 0.1` error on the 512-cell grid.
+
+| nu | Ssp3 order | Ssp3 e/e(0.1) | Eq 6.29 | Ssp43 order | Ssp43 e/e(0.1) | Eq 6.29 |
+|---|---|---|---|---|---|---|
+| 0.10 | 3.00 | 1.00 | 1.00 | 3.00 | 1.00 | 1.00 |
+| 0.50 | 3.00 | 1.06 | 1.06 | 3.00 | 1.03 | 1.03 |
+| 0.90 | 3.00 | 1.36 | 1.36 | 3.00 | 1.18 | 1.18 |
+| 1.26 | 3.00 | 2.00 | 2.00 | 3.00 | 1.50 | 1.50 |
+| 1.30 | 3.00 | 2.10 | 2.10 | 3.00 | 1.55 | 1.55 |
+| 1.59 | 3.00 | 3.01 | 3.01 | 3.00 | 2.00 | 2.00 |
+| 1.60 | 3.00 | 3.05 | 3.05 | 3.00 | 2.02 | 2.02 |
+| 1.70 | unstable | - | 3.45 | 3.00 | 2.23 | 2.23 |
+| 2.10 | unstable | - | 5.63 | unstable | - | 3.31 |
+
+Every stable entry matches Eq 6.29 to the three figures printed, and order stays 3.00
+throughout. The two unstable rows bracket the ceilings of the table above from the other
+side: `Ssp3` converges cleanly at 1.60 and diverges at 1.70, against the predicted 1.626,
+and `Ssp43` converges at 1.70 and diverges at 2.10, against 2.037.
+
+The `nu = 1.26` and `nu = 1.59` rows are there because `2^(1/3)` and `4^(1/3)` are where
+each law doubles its `nu = 0` value, and both measure exactly 2.00. What that is worth when
+choosing a Courant number to run is in `time_efficiency.md`.
+
+Repeating the sweep on the nonlinear Section 4.2 Burgers case of the order table gives 2.9
+to 3.0 at every stable `nu` as well, with ratios of 1.00, 0.98, 1.02, 1.16, 1.46 and 1.64
+for `Ssp3` at `nu` of 0.1, 0.5, 0.9, 1.3, 1.6 and 1.7. Those run below the linear law
+because the max norm there sits on a steepening profile where spatial truncation carries
+more of the error, diluting the temporal share Eq 6.29 describes. The order is the claim
+being graded; the ratios are reported for shape, not for agreement.
+
+### Where the solver itself stops
+
+The rows above are scalar. What ships is the Euler equations through the RoeM flux and the
+real `Driver`, so its limit is measured separately: a 1e-3 relative standing acoustic mode
+on 256 cells, `Wall` both ends, ten acoustic transits, bisected on the Courant number seven
+times. At that amplitude the smoothness indicator holds the limiter on `phi_3`, so the
+operator is the unlimited kappa = 1/3 one the analysis covers.
+
+| Method | Scheme | Last stable | First unstable | Linear |
+|---|---|---|---|---|
+| MusclRoeM1D | Ssp3 | 1.622 | 1.644 | 1.626 |
+| MusclRoeM1D | Ssp43 | 2.081 | 2.103 | 2.037 |
+| MusclRoeM1D | Ssp2 | 1.141 | 1.163 | 0.874 |
+| MusclRoeM1D | Euler | none | 0.200 | unstable |
+| RoeM1D | Euler | 0.988 | 1.009 | 1.000 |
+| RoeM1D | Ssp2 | 1.009 | 1.031 | 1.000 |
+| RoeM1D | Ssp3 | 1.250 | 1.272 | 1.256 |
+| RoeM1D | Ssp43 | 2.016 | 2.038 | 2.000 |
+
+Six of the eight brackets contain the linear prediction. `Ssp2` with the reconstruction is
+the exception for the reason given above: its boundary is soft, so ten transits at 1.14 do
+not grow enough to trip the test, and the measured figure overstates a limit the analysis
+puts at 0.874. `Ssp43` with the reconstruction sits 2% above its prediction, which is the
+same softness at a much smaller scale.
+
+`MusclRoeM1D` with `Euler` fails at every Courant number tried, down to 0.2, confirming the
+analysis: forward Euler's stability region touches the imaginary axis only at the origin,
+and this reconstruction has no dissipative part to pull the symbol off it. The failure is
+gradual rather than immediate, which is what makes it worth stating -- a run can proceed for
+thousands of steps before diverging.
+
+With a shock the ceiling barely moves. Sod on 400 cells to `t = 0.15` completes at every
+Courant number up to 1.60 with `Ssp3` and 1.80 with `Ssp43`, and fails at 1.80 and 2.00
+respectively. The positivity fallback of `enforce_positivity` fires zero times at every one
+of those settings, so on this problem it is a guard that is never reached rather than a
+correction the scheme leans on.
+
 ## Note: why the radius is dimensionless here
 
 Their Eq 4.34 is `eta = (d- ^2 + d+ ^2) / (r dx)^2`, which carries the units of the
@@ -136,16 +246,42 @@ conserved row separately and across a contact the energy row is genuinely smooth
 density row jumps. The boundary results in `Boundaries.md` were re-measured against this
 reconstruction and are recorded there.
 
+## Note: how the Ssp43 coefficients were obtained
+
+Their printed Eq 6.3 is not usable as set: its third-stage coefficients 2/3 and 1/2 sum to
+7/6, so the stage is not a convex combination and the scheme it describes is not
+conservative. The coefficients shipped were recovered from Eq 6.7 instead, which gives the
+stability polynomial `1 + z + z^2/2 + z^3/6 + z^4/48`. Expanding the standard Kraaijevanger
+four-stage third-order scheme gives `(2a + a^4)/3` with `a = 1 + z/2`, which is that
+polynomial exactly, fixing the stages as
+
+```
+u1 = u^n                 + (1/2) dt L(u^n)
+u2 = u1                  + (1/2) dt L(u1)
+u3 = (2/3)u^n + (1/3)u2  + (1/6) dt L(u2)
+u4 = u3                  + (1/2) dt L(u3)
+```
+
+Driving the shipped `TimeIntegrator::stages()` weights through the same scalar symbol the
+table above uses reproduces Eq 6.5 to 6.7 for all four integrators, with the worst deviation
+2.24e-16 for `Ssp43` and 1.24e-16 for the others, so the code path and the printed
+polynomials agree to rounding. Order on the Burgers and linear cases is third, independently
+of the thesis.
+
+## Note: the junction Courant number is not covered by any of this
+
+`Junction::get_timestep` is `courant * 2 V / sum(A (|u.n| + a))`, a control volume bound over
+the interfaces rather than a stencil bound, and neither this thesis nor the ghost junction
+paper analyses it. The same `courant` constant feeds it, so raising the Courant number on the
+strength of the tables above raises it at every junction too, where nothing here says what the
+limit is. Everything above was measured on single pipes.
+
 ## Not covered
 
 - Neelan and Nair 2022 (DOI 10.22055/jacm.2020.32845.2088), whose limiters were the other
   candidate. Their tables integrate with HRK42 and use Roe with a Harten entropy fix,
   neither of which is available here, so their columns are not reproducible and nothing is
   graded against them.
-- Cada and Torrilhon's Section 6.1 stability headroom. Their von Neumann analysis puts
-  this reconstruction with three-stage SSP Runge-Kutta stable to a Courant number near
-  1.63, and their Euler cases run at 1.5; the solver assumes 1.0 and that has not been
-  tested.
 - Their Chapter 10 two-dimensional cases and Chapter 11 stiff relaxation systems, which
   need dimensions and source terms this solver does not have.
 - The radius as a tuning parameter. Their Remark 4.5.1 recommends choosing it per problem,
