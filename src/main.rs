@@ -7,11 +7,13 @@ mod helpers;
 mod junctions;
 mod pipe_methods;
 mod pipes;
+mod validation_graphs;
 use boundaries::BoundaryCondition;
 use driver::Driver;
 use helpers::*;
 use junctions::*;
 use pipes::*;
+use validation_graphs::Problem;
 
 //Input parameters
 //multiplier on the Courant number each method runs best at, so 1.0 is the efficient
@@ -19,13 +21,18 @@ use pipes::*;
 const COURANT_SCALE: f64 = 1.0;
 const GAMMA: f64 = 1.4; //ratio of specific heats
 const T_END: f64 = 3.0; //how much virtual time to run the simulation
-const N_CELLS: usize = 2048; //how many real cells there are
+const N_CELLS: usize = 316; //how many real cells there are
 const DOMAIN_LENGTH: f64 = 1.0; //basically how long the pipe is in meters
 const N_PIPES: usize = 2; //number of pipes in the simulation
 const N_JUNCTIONS: usize = 1; //number of junctions in the simulation
 const PIPE_RADIUS: f64 = 30.0; //Pipe radius in mm
-const METHOD: MethodKind = MethodKind::RoeM1D; //interior method every pipe uses
+const METHOD: MethodKind = MethodKind::Muscl3RoeM1D; //interior method every pipe uses
 const RUN_MODE: RunMode = RunMode::Transient; //how the simulation decides it is finished
+
+//a benchmark runs on its own single pipe and graphs itself against the analytic solution,
+//replacing the network above. Problem::None runs the network instead. See validation/Sod.md
+const PROBLEM: Problem = Problem::Sod;
+const PROBLEM_TIME: f64 = 0.2; //virtual time the benchmark is graphed at, exactly
 
 //calculated parameters
 const DX: f64 = DOMAIN_LENGTH / N_CELLS as f64; //step size
@@ -83,6 +90,11 @@ fn main() {
     }
     */
 
+    if PROBLEM != Problem::None {
+        validation_graphs::run(PROBLEM, PROBLEM_TIME, METHOD, N_CELLS, GAMMA, COURANT_SCALE);
+        return;
+    }
+
     let mut pipes: BTreeMap<usize, InteriorMethod> = BTreeMap::new();
     let mut junctions: BTreeMap<usize, Junction> = BTreeMap::new();
 
@@ -136,7 +148,10 @@ fn main() {
 
     //ideally the density pulse should travel through the junciton and continue into pipe 1
     for id in 0..N_JUNCTIONS {
-        junctions.insert(id, Junction::new(GAMMA, Junction::courant_from(COURANT_SCALE), id));
+        junctions.insert(
+            id,
+            Junction::new(GAMMA, Junction::courant_from(COURANT_SCALE), id),
+        );
     }
 
     for link in &links {

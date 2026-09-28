@@ -336,7 +336,7 @@ impl Outward {
 
 ///Where a residual that falls with pressure crosses zero, taking Newton steps but
 /// bisecting whenever one would leave the bracket.
-fn root(mut lo: f64, mut hi: f64, residual: impl Fn(f64) -> (f64, f64)) -> f64 {
+pub(crate) fn root(mut lo: f64, mut hi: f64, residual: impl Fn(f64) -> (f64, f64)) -> f64 {
     let mut p = 0.5 * (lo + hi);
 
     for _ in 0..60 {

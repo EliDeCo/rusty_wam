@@ -488,16 +488,18 @@ impl InteriorMethod {
     pub fn unreal_check(&self) {
         self.solver().state().unreal_check();
     }
+    ///Refreshes the primitive buffers, which a completed step leaves stale.
+    pub fn decode(&mut self) {
+        self.solver_mut().state_mut().decode();
+    }
     pub fn rho(&self) -> &[f64] {
         let s = self.solver().state();
         s.real(&s.rho)
     }
-    #[allow(dead_code)]
     pub fn u(&self) -> &[f64] {
         let s = self.solver().state();
         s.real(&s.u)
     }
-    #[allow(dead_code)]
     pub fn p(&self) -> &[f64] {
         let s = self.solver().state();
         s.real(&s.p)

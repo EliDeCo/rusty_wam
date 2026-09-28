@@ -51,9 +51,9 @@ impl Decoded {
 struct Workspace {
     dq: Matrix3xX<f64>,  // n_total - 1
     q_l: Matrix3xX<f64>, // n_faces
-    q_r: Matrix3xX<f64>,   // n_faces
-    wl: Decoded,           // n_faces - primitives/flux decoded from q_l
-    wr: Decoded,           // n_faces - primitives/flux decoded from q_r
+    q_r: Matrix3xX<f64>, // n_faces
+    wl: Decoded,         // n_faces - primitives/flux decoded from q_l
+    wr: Decoded,         // n_faces - primitives/flux decoded from q_r
 }
 
 impl Workspace {
@@ -210,7 +210,10 @@ fn reconstruct_o2(
     first: usize,
 ) {
     let n_faces = q_l.ncols();
-    debug_assert!(first >= 2, "MUSCL reconstruction needs at least 2 ghost cells");
+    debug_assert!(
+        first >= 2,
+        "MUSCL reconstruction needs at least 2 ghost cells"
+    );
 
     for k in 0..n_faces {
         let (left, right) = (first - 1 + k, first + k);
