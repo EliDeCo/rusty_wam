@@ -1,4 +1,4 @@
-# MusclRoeM1D validation
+# Muscl3RoeM1D validation
 
 What the reconstruction reproduces from van Leer and Nishikawa 2021
 (DOI 10.1016/j.jcp.2021.110640), which sets the order of accuracy, and from Cada and
@@ -121,7 +121,10 @@ and which Courant number to actually run, is in `time_efficiency.md`.
 | kappa = 1/3, as shipped | Ssp43 | 2.037 | 2.04 | Fig 6.2 right |
 | kappa = 1/3, as shipped | Ssp2 | 0.874 | 0.83 | Section 6.1 |
 | kappa = 1/3, as shipped | Euler | unstable at every nu | not given | - |
-| kappa = 0 | Ssp2 | 1.000 | 1.0 | Fig 6.1 |
+| kappa = 0, the second order variant | Ssp2 | 1.000 | 1.0 | Fig 6.1 |
+| kappa = 0, the second order variant | Ssp3 | 1.176 | not given | - |
+| kappa = 0, the second order variant | Ssp43 | 1.601 | not given | - |
+| kappa = 0, the second order variant | Euler | unstable at every nu | not given | - |
 | phi = theta | Ssp2 | 0.500 | 0.5 | Fig 6.3 |
 | phi = theta | Ssp3 | 0.628 | 0.63 | Fig 6.3 |
 | phi = 2 theta | Ssp2, Ssp3 | unstable at every nu | absolutely unstable | Section 6.1 |
@@ -187,22 +190,26 @@ operator is the unlimited kappa = 1/3 one the analysis covers.
 
 | Method | Scheme | Last stable | First unstable | Linear |
 |---|---|---|---|---|
-| MusclRoeM1D | Ssp3 | 1.622 | 1.644 | 1.626 |
-| MusclRoeM1D | Ssp43 | 2.081 | 2.103 | 2.037 |
-| MusclRoeM1D | Ssp2 | 1.141 | 1.163 | 0.874 |
-| MusclRoeM1D | Euler | none | 0.200 | unstable |
+| Muscl3RoeM1D | Ssp3 | 1.622 | 1.644 | 1.626 |
+| Muscl3RoeM1D | Ssp43 | 2.081 | 2.103 | 2.037 |
+| Muscl3RoeM1D | Ssp2 | 1.141 | 1.163 | 0.874 |
+| Muscl3RoeM1D | Euler | none | 0.200 | unstable |
+| Muscl2RoeM1D | Ssp2 | 1.009 | 1.031 | 1.000 |
+| Muscl2RoeM1D | Ssp3 | 1.272 | 1.294 | 1.176 |
+| Muscl2RoeM1D | Ssp43 | 1.819 | 1.841 | 1.601 |
+| Muscl2RoeM1D | Euler | none | 0.200 | unstable |
 | RoeM1D | Euler | 0.988 | 1.009 | 1.000 |
 | RoeM1D | Ssp2 | 1.009 | 1.031 | 1.000 |
 | RoeM1D | Ssp3 | 1.250 | 1.272 | 1.256 |
 | RoeM1D | Ssp43 | 2.016 | 2.038 | 2.000 |
 
-Six of the eight brackets contain the linear prediction. `Ssp2` with the reconstruction is
-the exception for the reason given above: its boundary is soft, so ten transits at 1.14 do
-not grow enough to trip the test, and the measured figure overstates a limit the analysis
-puts at 0.874. `Ssp43` with the reconstruction sits 2% above its prediction, which is the
-same softness at a much smaller scale.
+Every bracket either contains the linear prediction or sits above it, never below, which is
+the direction a limiter can move a ceiling: the analysis is of the unlimited symbol, and the
+dissipation a limiter adds is not in it. The two that sit furthest above, `kappa = 1/3` with
+`Ssp2` at 1.14 against 0.874 and `kappa = 0` with `Ssp43` at 1.82 against 1.601, are also
+the two whose boundary is softest, so ten transits do not grow enough to trip the test.
 
-`MusclRoeM1D` with `Euler` fails at every Courant number tried, down to 0.2, confirming the
+`Muscl3RoeM1D` with `Euler` fails at every Courant number tried, down to 0.2, confirming the
 analysis: forward Euler's stability region touches the imaginary axis only at the origin,
 and this reconstruction has no dissipative part to pull the symbol off it. The failure is
 gradual rather than immediate, which is what makes it worth stating -- a run can proceed for

@@ -1,6 +1,10 @@
 use crate::boundaries::BoundaryCondition;
 use crate::helpers::unphysical;
-use crate::pipe_methods::{muscl_roem1d::MusclRoeM1D, roe1d::Roe1D, roem1d::RoeM1D};
+use crate::pipe_methods::{
+    muscl_roem1d::{Muscl2RoeM1D, Muscl3RoeM1D},
+    roe1d::Roe1D,
+    roem1d::RoeM1D,
+};
 use nalgebra::{Matrix1xX, Matrix3xX, Vector3};
 use std::ops::AddAssign;
 
@@ -278,7 +282,8 @@ pub trait InteriorSolver {
 pub enum MethodKind {
     RoeM1D,
     Roe1D,
-    MusclRoeM1D,
+    Muscl2RoeM1D,
+    Muscl3RoeM1D,
 }
 
 impl MethodKind {
@@ -288,8 +293,42 @@ impl MethodKind {
     pub(crate) fn n_ghost(&self) -> usize {
         match self {
             MethodKind::RoeM1D | MethodKind::Roe1D => 1,
-            MethodKind::MusclRoeM1D => 2,
+            MethodKind::Muscl2RoeM1D | MethodKind::Muscl3RoeM1D => 2,
         }
+    }
+
+    ///The integrator this method is cheapest with, measured in `time_efficiency.md`.
+    /// Pairing is not a free choice: Euler is unstable with any reconstruction, and the
+    /// first order methods are both slower and less accurate under a multi-stage scheme.
+    pub(crate) fn integrator(&self) -> TimeIntegrator {
+        match self {
+            MethodKind::RoeM1D | MethodKind::Roe1D => TimeIntegrator::Euler,
+            MethodKind::Muscl2RoeM1D => TimeIntegrator::Ssp2,
+            MethodKind::Muscl3RoeM1D => TimeIntegrator::Ssp3,
+        }
+    }
+
+    ///Courant number this method runs best at, and the one above which it goes unstable.
+    /// Both measured in `time_efficiency.md`, for this method with its paired integrator.
+    fn courant_limits(&self) -> (f64, f64) {
+        match self {
+            MethodKind::RoeM1D | MethodKind::Roe1D => (0.95, 1.000),
+            MethodKind::Muscl2RoeM1D => (0.90, 1.000),
+            MethodKind::Muscl3RoeM1D => (1.26, 1.626),
+        }
+    }
+
+    ///Resolves a multiplier against this method's best Courant number, so that a scale of
+    /// 1 is the efficient default whichever method is selected.
+    pub fn courant_from(&self, scale: f64) -> f64 {
+        let (best, ceiling) = self.courant_limits();
+        let courant = best * scale;
+        assert!(
+            courant < ceiling,
+            "courant {courant:.3} is past the {ceiling:.3} ceiling of this method; scale {scale} x best {best}, headroom is x{:.2}",
+            ceiling / best
+        );
+        courant
     }
 }
 
@@ -371,7 +410,8 @@ pub(crate) fn rk_stage(
 pub enum InteriorMethod {
     RoeM1D(RoeM1D),
     Roe1D(Roe1D),
-    MusclRoeM1D(MusclRoeM1D),
+    Muscl2RoeM1D(Muscl2RoeM1D),
+    Muscl3RoeM1D(Muscl3RoeM1D),
 }
 
 impl InteriorMethod {
@@ -408,7 +448,18 @@ impl InteriorMethod {
         match kind {
             MethodKind::RoeM1D => Self::RoeM1D(RoeM1D::new(shared)),
             MethodKind::Roe1D => Self::Roe1D(Roe1D::new(shared)),
-            MethodKind::MusclRoeM1D => Self::MusclRoeM1D(MusclRoeM1D::new(shared)),
+            MethodKind::Muscl2RoeM1D => Self::Muscl2RoeM1D(Muscl2RoeM1D::new(shared)),
+            MethodKind::Muscl3RoeM1D => Self::Muscl3RoeM1D(Muscl3RoeM1D::new(shared)),
+        }
+    }
+
+    ///Which method this is, so the driver can pair an integrator with it.
+    pub(crate) fn kind(&self) -> MethodKind {
+        match self {
+            Self::RoeM1D(_) => MethodKind::RoeM1D,
+            Self::Roe1D(_) => MethodKind::Roe1D,
+            Self::Muscl2RoeM1D(_) => MethodKind::Muscl2RoeM1D,
+            Self::Muscl3RoeM1D(_) => MethodKind::Muscl3RoeM1D,
         }
     }
 
@@ -417,14 +468,16 @@ impl InteriorMethod {
         match self {
             Self::RoeM1D(s) => s,
             Self::Roe1D(s) => s,
-            Self::MusclRoeM1D(s) => s,
+            Self::Muscl2RoeM1D(s) => s,
+            Self::Muscl3RoeM1D(s) => s,
         }
     }
     pub(crate) fn solver_mut(&mut self) -> &mut dyn InteriorSolver {
         match self {
             Self::RoeM1D(s) => s,
             Self::Roe1D(s) => s,
-            Self::MusclRoeM1D(s) => s,
+            Self::Muscl2RoeM1D(s) => s,
+            Self::Muscl3RoeM1D(s) => s,
         }
     }
 

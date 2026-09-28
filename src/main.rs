@@ -14,7 +14,9 @@ use junctions::*;
 use pipes::*;
 
 //Input parameters
-const COURANT: f64 = 0.9; //CFL courant number
+//multiplier on the Courant number each method runs best at, so 1.0 is the efficient
+//default whichever method is selected. See time_efficiency.md
+const COURANT_SCALE: f64 = 1.0;
 const GAMMA: f64 = 1.4; //ratio of specific heats
 const T_END: f64 = 3.0; //how much virtual time to run the simulation
 const N_CELLS: usize = 2048; //how many real cells there are
@@ -23,7 +25,6 @@ const N_PIPES: usize = 2; //number of pipes in the simulation
 const N_JUNCTIONS: usize = 1; //number of junctions in the simulation
 const PIPE_RADIUS: f64 = 30.0; //Pipe radius in mm
 const METHOD: MethodKind = MethodKind::RoeM1D; //interior method every pipe uses
-const RK_ORDER: TimeIntegrator = TimeIntegrator::Euler; //explicit SSP scheme, any method
 const RUN_MODE: RunMode = RunMode::Transient; //how the simulation decides it is finished
 
 //calculated parameters
@@ -122,7 +123,7 @@ fn main() {
             METHOD,
             q0,
             GAMMA,
-            COURANT,
+            METHOD.courant_from(COURANT_SCALE),
             DX,
             id,
             PIPE_RADIUS,
@@ -135,7 +136,7 @@ fn main() {
 
     //ideally the density pulse should travel through the junciton and continue into pipe 1
     for id in 0..N_JUNCTIONS {
-        junctions.insert(id, Junction::new(GAMMA, COURANT, id));
+        junctions.insert(id, Junction::new(GAMMA, Junction::courant_from(COURANT_SCALE), id));
     }
 
     for link in &links {
@@ -162,7 +163,7 @@ fn main() {
             .collect(),
     };
 
-    let mut driver = Driver::new(RK_ORDER, &pipes, &junctions);
+    let mut driver = Driver::new(&pipes, &junctions);
 
     println!("Beginning Simulation:");
 

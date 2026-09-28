@@ -55,6 +55,23 @@ impl Junction {
         }
     }
 
+    ///Resolves a multiplier against the Courant number a junction runs best at, so that
+    /// the same scale means the same thing here as it does for a pipe.
+    pub fn courant_from(scale: f64) -> f64 {
+        //A junction is a control volume with no stencil of its own, so its limit is its
+        //own: measured at 2.7 in the units of Eq 46b, near enough flat in branch count.
+        //2.0 sits under that and still clears the pipe bound for a two or three branch
+        //junction, which is where it would otherwise cost a third of the step.
+        const BEST: f64 = 2.0;
+        const CEILING: f64 = 2.7;
+        let courant = BEST * scale;
+        assert!(
+            courant < CEILING,
+            "junction courant {courant:.3} is past the {CEILING} ceiling; scale {scale} x best {BEST}"
+        );
+        courant
+    }
+
     ///Returns the minimum dt for this junction.
     pub fn get_timestep(&mut self) -> f64 {
         self.decode();
@@ -70,6 +87,8 @@ impl Junction {
             .map(|pipe| pipe.area * (self.u.dot(&pipe.normal).abs() + a))
             .sum();
 
+        //Their Eq 46b, balancing V/dt against half the face sum, which is the same bound
+        //the pipes get from Eq 44b
         self.courant * 2.0 * self.volume / wave_sum
     }
 

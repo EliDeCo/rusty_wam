@@ -80,20 +80,41 @@ pub struct Driver {
 }
 
 impl Driver {
-    ///Allocates every stage register once, sized from the objects it will advance.
+    ///Allocates every stage register once, pairing each pipe's method with the integrator
+    /// it is cheapest under. One stage loop drives every pipe and junction, so the network
+    /// takes a single integrator: the most capable if the methods ever disagree, since a
+    /// method that wants Euler is stable under Ssp3 and never the reverse.
     pub fn new(
+        pipes: &BTreeMap<usize, InteriorMethod>,
+        junctions: &BTreeMap<usize, Junction>,
+    ) -> Self {
+        let integrator = pipes
+            .values()
+            .map(|p| p.kind().integrator())
+            .max_by_key(|i| i.stages().len())
+            .unwrap_or(TimeIntegrator::Euler);
+
+        Self::with_integrator(integrator, pipes, junctions)
+    }
+
+    ///The same, with the integrator named rather than derived. Only the scratch harnesses
+    /// use this, to sweep pairings the shipped solver would never select.
+    pub fn with_integrator(
         integrator: TimeIntegrator,
         pipes: &BTreeMap<usize, InteriorMethod>,
         junctions: &BTreeMap<usize, Junction>,
     ) -> Self {
-        //forward Euler is unstable with a reconstructing method at every Courant number, and
-        //fails thousands of steps in rather than at once: validation/MusclRoeM1D.md
+        //forward Euler is unstable with any reconstruction at every Courant number, at
+        //kappa = 0 as well as 1/3, and fails thousands of steps in rather than at once
+        let reconstructs = pipes.values().any(|p| {
+            matches!(
+                p,
+                InteriorMethod::Muscl2RoeM1D(_) | InteriorMethod::Muscl3RoeM1D(_)
+            )
+        });
         assert!(
-            !(matches!(integrator, TimeIntegrator::Euler)
-                && pipes
-                    .values()
-                    .any(|p| matches!(p, InteriorMethod::MusclRoeM1D(_)))),
-            "MusclRoeM1D is unstable with Euler at every Courant number; use Ssp2 or higher"
+            !(matches!(integrator, TimeIntegrator::Euler) && reconstructs),
+            "a MUSCL method is unstable with Euler at every Courant number; use Ssp2 or higher"
         );
 
         let n_regs = integrator.n_registers();

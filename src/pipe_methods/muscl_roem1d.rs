@@ -1,6 +1,8 @@
-// The kappa = 1/3 finite volume MUSCL scheme, which is third order accurate, limited by
-// Cada & Torrilhon's compact third-order limiter so that it stays third order at smooth
-// extrema instead of clipping them. See validation/MusclRoeM1D.md
+// The finite volume MUSCL kappa-family in two orders, sharing everything but the rule that
+// limits a cell average to its faces. kappa = 1/3 is third order, limited by Cada &
+// Torrilhon so it stays third order at smooth extrema; every other kappa is second order,
+// and kappa = 0 is taken with a TVD limiter that clips extrema by design.
+// See validation/Muscl3RoeM1D.md and validation/Muscl2RoeM1D.md
 // https://doi.org/10.1016/j.jcp.2021.110640
 // https://doi.org/10.1016/j.jcp.2009.02.020
 //
@@ -11,12 +13,12 @@ use crate::pipes::{BoundaryPair, InteriorSolver, PipeState};
 use nalgebra::{Matrix1xX, Matrix3, Matrix3x1, Matrix3xX};
 use std::ops::AddAssign;
 
-///MUSCL blend parameter. The limiter's bounds are derived for 1/3 and only this value
-/// is third order accurate, so it is fixed rather than a knob.
+///MUSCL blend parameter of the third order variant. Cada's bounds are derived for 1/3 and
+/// only this value is third order accurate, so it is fixed rather than a knob.
 const KAPPA: f64 = 1.0 / 3.0;
 
 ///Radius of the asymptotic region, dimensionless because the indicator below divides by
-/// each row's own acoustic scale. Measured, not fitted: see validation/MusclRoeM1D.md
+/// each row's own acoustic scale. Measured, not fitted: see validation/Muscl3RoeM1D.md
 const R_SMOOTH: f64 = 1.0;
 
 ///Bundles everything `decode_state` + `euler_flux` produce, so the RoeM face loop can
@@ -47,9 +49,8 @@ impl Decoded {
 ///Scratch buffers for one residual evaluation, sized once outside the time loop
 /// (same preallocation style as the rest of the solver).
 struct Workspace {
-    dq: Matrix3xX<f64>,    // n_total - 1
-    scale: Matrix3xX<f64>, // n_total - what the smoothness indicator divides by
-    q_l: Matrix3xX<f64>,   // n_faces
+    dq: Matrix3xX<f64>,  // n_total - 1
+    q_l: Matrix3xX<f64>, // n_faces
     q_r: Matrix3xX<f64>,   // n_faces
     wl: Decoded,           // n_faces - primitives/flux decoded from q_l
     wr: Decoded,           // n_faces - primitives/flux decoded from q_r
@@ -59,7 +60,6 @@ impl Workspace {
     fn new(n_total: usize, n_faces: usize) -> Self {
         Workspace {
             dq: Matrix3xX::zeros(n_total - 1),
-            scale: Matrix3xX::zeros(n_total),
             q_l: Matrix3xX::zeros(n_faces),
             q_r: Matrix3xX::zeros(n_faces),
             wl: Decoded::zeros(n_faces),
@@ -175,10 +175,61 @@ fn cell_differences(q: &Matrix3xX<f64>, dq: &mut Matrix3xX<f64>) {
     q.columns(1, n_diff).sub_to(&q.columns(0, n_diff), dq);
 }
 
-///Reconstructs the left/right face states from cell averages using the kappa-family
-/// MUSCL blend (kappa=1/3 by default), using a 4 wide stencil.
-/// The `first`-relative offsets reduce to the reference's literals when first == 2.
-fn reconstruct(
+// --------------------------------------------------------------------------------------
+// Second order: kappa = 0 limited by a TVD slope limiter
+// --------------------------------------------------------------------------------------
+
+///Limits the near difference against the far one, returning the slope to half-step with.
+/// Monotonized central: the central slope, clipped to twice either one-sided slope. It is
+/// the least diffusive of the standard TVD limiters, which is what decides the cost of
+/// reaching a given accuracy -- see validation/Muscl2RoeM1D.md and time_efficiency.md.
+/// Symmetric in its two arguments, which is Cada & Torrilhon's Eq 3.38 written so that
+/// reaching it needs no division.
+fn limited_slope(d_near: f64, d_far: f64) -> f64 {
+    minmod(0.5 * (d_near + d_far), minmod(2.0 * d_near, 2.0 * d_far))
+}
+
+///Smaller magnitude of two same-signed slopes, zero if they disagree.
+fn minmod(a: f64, b: f64) -> f64 {
+    if a * b <= 0.0 {
+        0.0
+    } else if a.abs() < b.abs() {
+        a
+    } else {
+        b
+    }
+}
+
+///Second order reconstruction: kappa = 0 with the slopes limited, over the same 4 wide
+/// stencil the third order variant uses so the two stay directly comparable.
+fn reconstruct_o2(
+    q: &Matrix3xX<f64>,
+    dq: &Matrix3xX<f64>,
+    q_l: &mut Matrix3xX<f64>,
+    q_r: &mut Matrix3xX<f64>,
+    first: usize,
+) {
+    let n_faces = q_l.ncols();
+    debug_assert!(first >= 2, "MUSCL reconstruction needs at least 2 ghost cells");
+
+    for k in 0..n_faces {
+        let (left, right) = (first - 1 + k, first + k);
+
+        for row in 0..3 {
+            let back = dq[(row, first - 2 + k)]; // backward difference of the left cell
+            let mid = dq[(row, first - 1 + k)]; // shared by both cells
+            let fwd = dq[(row, first + k)]; // forward difference of the right cell
+
+            q_l[(row, k)] = q[(row, left)] + 0.5 * limited_slope(mid, back);
+            q_r[(row, k)] = q[(row, right)] - 0.5 * limited_slope(mid, fwd);
+        }
+    }
+}
+
+///Third order reconstruction: kappa = 1/3 over a 4 wide stencil, limited by Cada's
+/// compact limiter. The `first`-relative offsets reduce to the reference's literals when
+/// first == 2.
+fn reconstruct_o3(
     q: &Matrix3xX<f64>,
     dq: &Matrix3xX<f64>,
     scale: &Matrix3xX<f64>,
@@ -384,38 +435,40 @@ fn roe_flux(
 
 ///Ties reconstruction and the Riemann solve together, filling phi at every face.
 /// q must already have its ghosts filled by apply_bc.
-fn fill_phi(
+///Everything after reconstruction, which both variants share: the positivity fallback and
+/// the RoeM flux through each face.
+fn flux_from_faces(
     q: &Matrix3xX<f64>,
     ws: &mut Workspace,
     phi: &mut Matrix3xX<f64>,
     first: usize,
-    dx: f64,
     gamma: f64,
 ) {
-    cell_differences(q, &mut ws.dq); //calculates dq
-    fill_scales(q, &mut ws.scale, dx, gamma);
-    //reconstructs q_l and q_r, limited so smooth extrema keep third order
-    reconstruct(q, &ws.dq, &ws.scale, &mut ws.q_l, &mut ws.q_r, first);
-
-    enforce_positivity(q, &mut ws.q_l, &mut ws.q_r, first, gamma); // last line of defense before the flux
-
-    roe_flux(&ws.q_l, &ws.q_r, &mut ws.wl, &mut ws.wr, phi, gamma); //calculates the roe flux through each face
+    enforce_positivity(q, &mut ws.q_l, &mut ws.q_r, first, gamma); //last line of defense
+    roe_flux(&ws.q_l, &ws.q_r, &mut ws.wl, &mut ws.wr, phi, gamma);
 }
 
 ///Third order MUSCL reconstruction around the RoeM flux.
-pub struct MusclRoeM1D {
+pub struct Muscl3RoeM1D {
     shared: PipeState,
     ws: Workspace,
+    ///what the smoothness indicator divides by, per cell and per row
+    scale: Matrix3xX<f64>,
 }
 
-impl MusclRoeM1D {
+impl Muscl3RoeM1D {
     pub(crate) fn new(state: PipeState) -> Self {
         let ws = Workspace::new(state.n_total, state.n_faces);
-        Self { shared: state, ws }
+        let scale = Matrix3xX::zeros(state.n_total);
+        Self {
+            shared: state,
+            ws,
+            scale,
+        }
     }
 }
 
-impl InteriorSolver for MusclRoeM1D {
+impl InteriorSolver for Muscl3RoeM1D {
     fn state(&self) -> &PipeState {
         &self.shared
     }
@@ -424,12 +477,55 @@ impl InteriorSolver for MusclRoeM1D {
     }
 
     ///One residual evaluation for the state q, in the shared df convention.
-    /// Decodes its own face states, so it never touches the shared primitives.
-    ///Reconstructs from `q` directly, so the decoded primitives are of no use here.
+    /// Reconstructs from `q` directly, so the decoded primitives are of no use here.
     fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair, _decoded: bool) {
         let (first, dx, gamma) = (self.shared.first, self.shared.dx, self.shared.gamma);
+        let Self {
+            shared, ws, scale, ..
+        } = self;
+
+        cell_differences(q, &mut ws.dq);
+        fill_scales(q, scale, dx, gamma);
+        //limited so smooth extrema keep third order rather than being clipped
+        reconstruct_o3(q, &ws.dq, scale, &mut ws.q_l, &mut ws.q_r, first);
+        flux_from_faces(q, ws, &mut shared.phi, first, gamma);
+
+        shared.difference_flux(bc);
+    }
+}
+
+///Second order MUSCL reconstruction around the RoeM flux, kappa = 0 and TVD.
+pub struct Muscl2RoeM1D {
+    shared: PipeState,
+    ws: Workspace,
+}
+
+impl Muscl2RoeM1D {
+    pub(crate) fn new(state: PipeState) -> Self {
+        let ws = Workspace::new(state.n_total, state.n_faces);
+        Self { shared: state, ws }
+    }
+}
+
+impl InteriorSolver for Muscl2RoeM1D {
+    fn state(&self) -> &PipeState {
+        &self.shared
+    }
+    fn state_mut(&mut self) -> &mut PipeState {
+        &mut self.shared
+    }
+
+    ///One residual evaluation for the state q, in the shared df convention.
+    /// No smoothness indicator: a TVD limiter clips extrema by design, so there is
+    /// nothing for one to protect.
+    fn residual(&mut self, q: &Matrix3xX<f64>, bc: &BoundaryPair, _decoded: bool) {
+        let (first, gamma) = (self.shared.first, self.shared.gamma);
         let Self { shared, ws, .. } = self;
-        fill_phi(q, ws, &mut shared.phi, first, dx, gamma);
+
+        cell_differences(q, &mut ws.dq);
+        reconstruct_o2(q, &ws.dq, &mut ws.q_l, &mut ws.q_r, first);
+        flux_from_faces(q, ws, &mut shared.phi, first, gamma);
+
         shared.difference_flux(bc);
     }
 }
